@@ -19,12 +19,14 @@ const ALLOWED_USER_IDS = new Set(
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n) && n > 0)
 );
-// Корневая папка: внутри неё лежат папки проектов и папка _chat для обычного чата
+// Корневая папка с папками проектов (например, рабочий стол с git-репозиториями)
 const PROJECTS_DIR =
   process.env.PROJECTS_DIR ||
   process.env.WORKING_DIR ||
   path.join(process.cwd(), "workspace");
-const CHAT_DIR = path.join(PROJECTS_DIR, "_chat");
+// Папка обычного чата — отдельно, чтобы не засорять папку проектов
+const CHAT_DIR =
+  process.env.CHAT_DIR || path.join(process.cwd(), "workspace", "_chat");
 
 if (!BOT_TOKEN) {
   console.error("Ошибка: TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните.");
@@ -101,13 +103,19 @@ function modeLabel(cs: ChatState): string {
 
 // ---------- Проекты ----------
 
-function listProjects(): string[] {
+type ProjectEntry = { name: string; git: boolean };
+
+function listProjects(): ProjectEntry[] {
   try {
     return fs
       .readdirSync(PROJECTS_DIR, { withFileTypes: true })
       .filter((e) => e.isDirectory() && !e.name.startsWith("_") && !e.name.startsWith("."))
-      .map((e) => e.name)
-      .sort();
+      .map((e) => ({
+        name: e.name,
+        git: fs.existsSync(path.join(PROJECTS_DIR, e.name, ".git")),
+      }))
+      // git-репозитории сверху, внутри групп — по алфавиту
+      .sort((a, b) => Number(b.git) - Number(a.git) || a.name.localeCompare(b.name, "ru"));
   } catch {
     return [];
   }
@@ -427,10 +435,10 @@ bot.on("callback_query:data", async (ctx) => {
 async function handleProjectButton(ctx: Context, chatId: number): Promise<void> {
   const cs = getChatState(chatId);
   const projects = listProjects();
-  lastProjectList.set(chatId, projects);
+  lastProjectList.set(chatId, projects.map((p) => p.name));
   const kb = new InlineKeyboard();
-  projects.forEach((name, i) => {
-    kb.text(name, `proj:${i}`).row();
+  projects.forEach((p, i) => {
+    kb.text(`${p.git ? "🟢" : "📂"} ${p.name}`, `proj:${i}`).row();
   });
   kb.text("➕ Новый проект", "projnew");
   await ctx.reply(
