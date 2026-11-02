@@ -33,6 +33,11 @@ const CHAT_DIR =
   process.env.CHAT_DIR || path.join(process.cwd(), "workspace", "_chat");
 // Аккаунт GitHub: список проектов = репозитории этого аккаунта
 const GITHUB_USER = process.env.GITHUB_USER || "levkastergit";
+// Дополнительные проекты — абсолютные пути через точку с запятой
+const EXTRA_PROJECTS = (process.env.EXTRA_PROJECTS || "")
+  .split(";")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!BOT_TOKEN) {
   console.error("Ошибка: TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните.");
@@ -63,6 +68,9 @@ fs.mkdirSync(CHAT_DIR, { recursive: true });
 type ChatState = {
   mode: "chat" | "project";
   project?: string;
+  // Абсолютный путь папки проекта; для старых записей отсутствует —
+  // тогда берётся PROJECTS_DIR/<project>
+  projectDir?: string;
   // ключ: "chat" или "project:<имя>" -> session_id Клода
   sessions: Record<string, string>;
 };
@@ -96,9 +104,10 @@ function sessionKey(cs: ChatState): string {
 }
 
 function cwdFor(cs: ChatState): string {
-  return cs.mode === "project" && cs.project
-    ? path.join(PROJECTS_DIR, cs.project)
-    : CHAT_DIR;
+  if (cs.mode === "project" && cs.project) {
+    return cs.projectDir || path.join(PROJECTS_DIR, cs.project);
+  }
+  return CHAT_DIR;
 }
 
 function modeLabel(cs: ChatState): string {
@@ -109,9 +118,9 @@ function modeLabel(cs: ChatState): string {
 
 // ---------- Проекты ----------
 
-// Проект = репозиторий аккаунта GitHub. localName — имя папки на диске,
-// если репозиторий уже склонирован (сопоставление без учёта регистра).
-type ProjectEntry = { name: string; localName?: string };
+// Проект = репозиторий аккаунта GitHub или дополнительный локальный путь.
+// dir — абсолютный путь папки на диске, если она уже есть.
+type ProjectEntry = { name: string; dir?: string };
 
 function localDirs(): Map<string, string> {
   const map = new Map<string, string>();
@@ -140,10 +149,18 @@ async function listProjects(): Promise<ProjectEntry[]> {
   }
   const repos = (await res.json()) as { name: string }[];
   const local = localDirs();
-  return repos.map((r) => ({
-    name: r.name,
-    localName: local.get(r.name.toLowerCase()),
-  }));
+  const entries: ProjectEntry[] = repos.map((r) => {
+    const localName = local.get(r.name.toLowerCase());
+    return {
+      name: r.name,
+      dir: localName ? path.join(PROJECTS_DIR, localName) : undefined,
+    };
+  });
+  // Дополнительные проекты по абсолютным путям (вне GitHub)
+  for (const p of EXTRA_PROJECTS) {
+    entries.push({ name: path.basename(p), dir: p });
+  }
+  return entries;
 }
 
 function sanitizeProjectName(raw: string): string {
@@ -433,8 +450,12 @@ bot.on("callback_query:data", async (ctx) => {
       // не критично
     }
 
-    let folderName = entry.localName;
-    if (!folderName) {
+    let projectDir = entry.dir;
+    if (projectDir && !fs.existsSync(projectDir)) {
+      await ctx.reply(`Папка проекта не найдена: ${projectDir}`);
+      return;
+    }
+    if (!projectDir) {
       // Репозитория нет на диске — клонируем с GitHub
       const target = path.join(PROJECTS_DIR, entry.name);
       const cloneMsg = await ctx.reply(`⏳ Клонирую ${GITHUB_USER}/${entry.name} с GitHub…`);
@@ -444,7 +465,7 @@ bot.on("callback_query:data", async (ctx) => {
           ["clone", `https://github.com/${GITHUB_USER}/${entry.name}.git`, target],
           { timeout: 5 * 60 * 1000 }
         );
-        folderName = entry.name;
+        projectDir = target;
       } catch (err) {
         console.error("Ошибка клонирования:", err);
         await ctx.reply(
@@ -463,11 +484,12 @@ bot.on("callback_query:data", async (ctx) => {
 
     const cs = getChatState(chatId);
     cs.mode = "project";
-    cs.project = folderName;
+    cs.project = entry.name;
+    cs.projectDir = projectDir;
     saveState();
     const hasSession = Boolean(cs.sessions[sessionKey(cs)]);
     await ctx.reply(
-      `Выбран проект «${entry.name}»${entry.localName ? "" : " (склонирован)"}.\n` +
+      `Выбран проект «${entry.name}»${entry.dir ? "" : " (склонирован)"}.\nПапка: ${projectDir}\n` +
         (hasSession ? "Продолжаем прошлый диалог этого проекта (сбросить: /new)." : "Диалог проекта пока пуст — пишите задачу.")
     );
     return;
@@ -502,7 +524,7 @@ async function handleProjectButton(ctx: Context, chatId: number): Promise<void> 
   lastProjectList.set(chatId, projects);
   const kb = new InlineKeyboard();
   projects.forEach((p, i) => {
-    kb.text(`${p.localName ? "💻" : "☁️"} ${p.name}`, `proj:${i}`).row();
+    kb.text(`${p.dir ? "💻" : "☁️"} ${p.name}`, `proj:${i}`).row();
   });
   kb.text("➕ Новый проект", "projnew");
   await ctx.reply(
@@ -546,6 +568,7 @@ bot.on("message:text", async (ctx) => {
     const cs = getChatState(chatId);
     cs.mode = "project";
     cs.project = name;
+    cs.projectDir = dir;
     saveState();
     await ctx.reply(`Проект «${name}» создан и выбран.\nПапка: ${dir}\nПишите задачу.`);
     return;
