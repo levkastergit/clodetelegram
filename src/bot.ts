@@ -26,9 +26,13 @@ if (!BOT_TOKEN) {
   console.error("Ошибка: TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните.");
   process.exit(1);
 }
-if (ALLOWED_USER_IDS.size === 0) {
-  console.error("Ошибка: ALLOWED_USER_IDS не задан или некорректен (числовые Telegram ID через запятую).");
-  process.exit(1);
+// Режим настройки: ID не заданы — бот не даёт доступа к Клоду,
+// а только сообщает написавшему его Telegram ID для заполнения .env.
+const SETUP_MODE = ALLOWED_USER_IDS.size === 0;
+if (SETUP_MODE) {
+  console.warn(
+    "ALLOWED_USER_IDS пуст — запускаюсь в режиме настройки: отвечаю любому его же ID, доступа к Клоду нет."
+  );
 }
 
 // Пользователь выбрал работу через подписку Claude (Pro/Max).
@@ -116,6 +120,16 @@ const bot = new Bot(BOT_TOKEN);
 
 // Доступ только владельцу
 bot.use(async (ctx, next) => {
+  if (SETUP_MODE) {
+    if (ctx.from && ctx.message) {
+      console.log(`[настройка] Написал пользователь с ID: ${ctx.from.id}`);
+      await ctx.reply(
+        `Ваш Telegram ID: ${ctx.from.id}\n\n` +
+          "Бот в режиме настройки. Добавьте этот ID в ALLOWED_USER_IDS в файле .env и перезапустите бота."
+      );
+    }
+    return;
+  }
   if (!ctx.from || !ALLOWED_USER_IDS.has(ctx.from.id)) {
     console.warn(`Отклонён запрос от чужого пользователя: ${ctx.from?.id}`);
     return;
