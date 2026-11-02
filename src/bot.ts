@@ -969,10 +969,53 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  // Не ждём завершения: иначе бот не сможет принимать новые сообщения
-  // (нажатия кнопок, /stop) пока идёт задача. Ошибки ловятся внутри.
-  void runClaudeTurn(ctx, chatId, text);
+  // Сообщения, пришедшие подряд, собираются в один запрос (см. queueForClaude).
+  // Запуск Клода не ждётся в обработчике, чтобы не блокировать приём
+  // кнопок и /stop во время работы.
+  queueForClaude(ctx, chatId, text);
 });
+
+// ---------- Накопление сообщений в один запрос ----------
+// Несколько сообщений подряд (пересланные тексты, фото, комментарий)
+// собираются в один запрос: отправка Клоду происходит после паузы.
+
+const BATCH_DELAY_MS = 2000;
+
+type PendingBatch = {
+  parts: string[];
+  timer: ReturnType<typeof setTimeout>;
+  ctx: Context;
+};
+const batches = new Map<number, PendingBatch>();
+
+function queueForClaude(ctx: Context, chatId: number, part: string): void {
+  const existing = batches.get(chatId);
+  if (existing) {
+    existing.parts.push(part);
+    existing.ctx = ctx;
+    clearTimeout(existing.timer);
+    existing.timer = setTimeout(() => flushBatch(chatId), BATCH_DELAY_MS);
+  } else {
+    batches.set(chatId, {
+      parts: [part],
+      ctx,
+      timer: setTimeout(() => flushBatch(chatId), BATCH_DELAY_MS),
+    });
+  }
+}
+
+function flushBatch(chatId: number): void {
+  const batch = batches.get(chatId);
+  if (!batch) return;
+  if (running.has(chatId)) {
+    // Клод ещё занят предыдущей задачей — подождём и попробуем снова
+    batch.timer = setTimeout(() => flushBatch(chatId), BATCH_DELAY_MS);
+    return;
+  }
+  batches.delete(chatId);
+  const text = batch.parts.join("\n\n");
+  void runClaudeTurn(batch.ctx, chatId, text);
+}
 
 // ---------- Приём файлов из Telegram ----------
 
@@ -1024,10 +1067,10 @@ async function handleIncomingFile(
   try {
     const dest = await saveTelegramFile(ctx, fileId, suggestedName, cwd);
     await ctx.reply(`📎 Файл сохранён: ${dest}`);
-    const prompt =
-      `Я прислал файл, он сохранён по пути: ${dest}\n` +
-      (caption?.trim() ? caption.trim() : "Посмотри его.");
-    void runClaudeTurn(ctx, chatId, prompt);
+    const part =
+      `Я прислал файл, он сохранён по пути: ${dest}` +
+      (caption?.trim() ? `\n${caption.trim()}` : "");
+    queueForClaude(ctx, chatId, part);
   } catch (err) {
     console.error("Ошибка приёма файла:", err);
     await ctx.reply(
