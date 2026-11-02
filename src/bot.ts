@@ -6,6 +6,7 @@ import {
   type PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -211,6 +212,103 @@ const activeQuestionByChat = new Map<number, string>();
 
 // chatId -> список проектов, показанный последней инлайн-клавиатурой
 const lastProjectList = new Map<number, ProjectEntry[]>();
+// chatId -> список прошлых сессий, показанный после выбора проекта
+const lastSessionList = new Map<number, SessionInfo[]>();
+
+// ---------- Прошлые сессии Claude Code по папке проекта ----------
+// Claude Code (и SDK, и Cursor) хранит диалоги в ~/.claude/projects/<папка>,
+// где имя папки — путь проекта с заменой всех спецсимволов на дефисы.
+
+type SessionInfo = { id: string; mtime: Date; title: string };
+
+function encodeProjectDir(dir: string): string {
+  return dir.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+// Читает начало файла сессии и достаёт первую реплику пользователя
+function readSessionTitle(file: string): string {
+  try {
+    const fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    for (const line of buf.subarray(0, n).toString("utf8").split("\n")) {
+      try {
+        const obj = JSON.parse(line) as {
+          type?: string;
+          summary?: string;
+          message?: { content?: unknown };
+        };
+        if (obj.type === "summary" && typeof obj.summary === "string") {
+          return obj.summary;
+        }
+        if (obj.type === "user" && obj.message) {
+          const c = obj.message.content;
+          let text = "";
+          if (typeof c === "string") text = c;
+          else if (Array.isArray(c)) {
+            const t = (c as { type?: string; text?: string }[]).find(
+              (b) => b.type === "text" && typeof b.text === "string"
+            );
+            if (t?.text) text = t.text;
+          }
+          text = text.trim();
+          if (text) return text;
+        }
+      } catch {
+        // неполная строка в конце буфера — пропускаем
+      }
+    }
+  } catch {
+    // файл не прочитался — не критично
+  }
+  return "(без названия)";
+}
+
+function listPastSessions(projectDir: string, limit = 5): SessionInfo[] {
+  const projectsRoot = path.join(os.homedir(), ".claude", "projects");
+  const encoded = encodeProjectDir(projectDir).toLowerCase();
+  let dirName: string | undefined;
+  try {
+    dirName = fs
+      .readdirSync(projectsRoot)
+      .find((d) => d.toLowerCase() === encoded);
+  } catch {
+    return [];
+  }
+  if (!dirName) return [];
+  const full = path.join(projectsRoot, dirName);
+  let sessions: SessionInfo[];
+  try {
+    sessions = fs
+      .readdirSync(full)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({
+        id: f.slice(0, -".jsonl".length),
+        mtime: fs.statSync(path.join(full, f)).mtime,
+        title: "",
+      }));
+  } catch {
+    return [];
+  }
+  sessions.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+  const top = sessions.slice(0, limit);
+  for (const s of top) {
+    s.title = readSessionTitle(path.join(full, `${s.id}.jsonl`));
+  }
+  return top;
+}
+
+function sessionButtonLabel(s: SessionInfo): string {
+  const date = s.mtime.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const title = s.title.replace(/\s+/g, " ").slice(0, 40);
+  return `${date} · ${title}`;
+}
 // чаты, от которых ждём название нового проекта
 const awaitingProjectName = new Set<number>();
 
@@ -700,10 +798,60 @@ bot.on("callback_query:data", async (ctx) => {
     cs.project = entry.name;
     cs.projectDir = projectDir;
     saveState();
-    const hasSession = Boolean(cs.sessions[sessionKey(cs)]);
+
+    // Показываем прошлые диалоги по этой папке (включая сессии из Cursor)
+    const past = listPastSessions(projectDir);
+    if (past.length === 0) {
+      delete cs.sessions[sessionKey(cs)];
+      saveState();
+      await ctx.reply(
+        `Выбран проект «${entry.name}»${entry.dir ? "" : " (склонирован)"}.\nПапка: ${projectDir}\nПрошлых диалогов нет — пишите задачу.`
+      );
+      return;
+    }
+    lastSessionList.set(chatId, past);
+    const kb = new InlineKeyboard().text("🆕 Новый диалог", "sess:new").row();
+    past.forEach((s, i) => {
+      kb.text(sessionButtonLabel(s), `sess:${i}`).row();
+    });
     await ctx.reply(
-      `Выбран проект «${entry.name}»${entry.dir ? "" : " (склонирован)"}.\nПапка: ${projectDir}\n` +
-        (hasSession ? "Продолжаем прошлый диалог этого проекта (сбросить: /new)." : "Диалог проекта пока пуст — пишите задачу.")
+      `Выбран проект «${entry.name}»${entry.dir ? "" : " (склонирован)"}.\nПапка: ${projectDir}\n\nПродолжить прошлый диалог или начать новый?`,
+      { reply_markup: kb }
+    );
+    return;
+  }
+
+  // Выбор прошлого диалога (или нового) после выбора проекта
+  const sess = /^sess:(new|\d+)$/.exec(data);
+  if (sess) {
+    if (running.has(chatId)) {
+      await ctx.answerCallbackQuery({ text: "Дождитесь конца задачи или /stop." });
+      return;
+    }
+    const cs = getChatState(chatId);
+    const key = sessionKey(cs);
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageReplyMarkup(undefined);
+    } catch {
+      // не критично
+    }
+    if (sess[1] === "new") {
+      delete cs.sessions[key];
+      saveState();
+      await ctx.reply("🆕 Начат новый диалог — пишите задачу.");
+      return;
+    }
+    const list = lastSessionList.get(chatId) || [];
+    const chosen = list[Number(sess[1])];
+    if (!chosen) {
+      await ctx.reply("Этот список устарел — выберите проект заново.");
+      return;
+    }
+    cs.sessions[key] = chosen.id;
+    saveState();
+    await ctx.reply(
+      `Продолжаем диалог «${chosen.title.slice(0, 80)}». Пишите сообщение.`
     );
     return;
   }
