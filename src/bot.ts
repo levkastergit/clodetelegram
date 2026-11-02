@@ -7,6 +7,10 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 // ---------- Конфигурация ----------
 
@@ -27,6 +31,8 @@ const PROJECTS_DIR =
 // Папка обычного чата — отдельно, чтобы не засорять папку проектов
 const CHAT_DIR =
   process.env.CHAT_DIR || path.join(process.cwd(), "workspace", "_chat");
+// Аккаунт GitHub: список проектов = репозитории этого аккаунта
+const GITHUB_USER = process.env.GITHUB_USER || "levkastergit";
 
 if (!BOT_TOKEN) {
   console.error("Ошибка: TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните.");
@@ -103,22 +109,41 @@ function modeLabel(cs: ChatState): string {
 
 // ---------- Проекты ----------
 
-type ProjectEntry = { name: string; git: boolean };
+// Проект = репозиторий аккаунта GitHub. localName — имя папки на диске,
+// если репозиторий уже склонирован (сопоставление без учёта регистра).
+type ProjectEntry = { name: string; localName?: string };
 
-function listProjects(): ProjectEntry[] {
+function localDirs(): Map<string, string> {
+  const map = new Map<string, string>();
   try {
-    return fs
-      .readdirSync(PROJECTS_DIR, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && !e.name.startsWith("_") && !e.name.startsWith("."))
-      .map((e) => ({
-        name: e.name,
-        git: fs.existsSync(path.join(PROJECTS_DIR, e.name, ".git")),
-      }))
-      // git-репозитории сверху, внутри групп — по алфавиту
-      .sort((a, b) => Number(b.git) - Number(a.git) || a.name.localeCompare(b.name, "ru"));
+    for (const e of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
+      if (e.isDirectory() && !e.name.startsWith("_") && !e.name.startsWith(".")) {
+        map.set(e.name.toLowerCase(), e.name);
+      }
+    }
   } catch {
-    return [];
+    // папки нет — вернём пустую карту
   }
+  return map;
+}
+
+async function listProjects(): Promise<ProjectEntry[]> {
+  const res = await fetch(
+    `https://api.github.com/users/${GITHUB_USER}/repos?per_page=100&sort=pushed`,
+    {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`GitHub API: ${res.status} ${res.statusText}`);
+  }
+  const repos = (await res.json()) as { name: string }[];
+  const local = localDirs();
+  return repos.map((r) => ({
+    name: r.name,
+    localName: local.get(r.name.toLowerCase()),
+  }));
 }
 
 function sanitizeProjectName(raw: string): string {
@@ -145,7 +170,7 @@ const pendingApprovals = new Map<string, PendingApproval>();
 let approvalCounter = 0;
 
 // chatId -> список проектов, показанный последней инлайн-клавиатурой
-const lastProjectList = new Map<number, string[]>();
+const lastProjectList = new Map<number, ProjectEntry[]>();
 // чаты, от которых ждём название нового проекта
 const awaitingProjectName = new Set<number>();
 
@@ -396,24 +421,53 @@ bot.on("callback_query:data", async (ctx) => {
       return;
     }
     const list = lastProjectList.get(chatId) || [];
-    const name = list[Number(proj[1])];
-    if (!name || !fs.existsSync(path.join(PROJECTS_DIR, name))) {
+    const entry = list[Number(proj[1])];
+    if (!entry) {
       await ctx.answerCallbackQuery({ text: "Проект не найден, откройте список заново." });
       return;
     }
-    const cs = getChatState(chatId);
-    cs.mode = "project";
-    cs.project = name;
-    saveState();
     await ctx.answerCallbackQuery();
     try {
       await ctx.editMessageReplyMarkup(undefined);
     } catch {
       // не критично
     }
+
+    let folderName = entry.localName;
+    if (!folderName) {
+      // Репозитория нет на диске — клонируем с GitHub
+      const target = path.join(PROJECTS_DIR, entry.name);
+      const cloneMsg = await ctx.reply(`⏳ Клонирую ${GITHUB_USER}/${entry.name} с GitHub…`);
+      try {
+        await execFileAsync(
+          "git",
+          ["clone", `https://github.com/${GITHUB_USER}/${entry.name}.git`, target],
+          { timeout: 5 * 60 * 1000 }
+        );
+        folderName = entry.name;
+      } catch (err) {
+        console.error("Ошибка клонирования:", err);
+        await ctx.reply(
+          `Не удалось склонировать ${entry.name}: ` +
+            (err instanceof Error ? err.message : String(err))
+        );
+        return;
+      } finally {
+        try {
+          await ctx.api.deleteMessage(chatId, cloneMsg.message_id);
+        } catch {
+          // не критично
+        }
+      }
+    }
+
+    const cs = getChatState(chatId);
+    cs.mode = "project";
+    cs.project = folderName;
+    saveState();
     const hasSession = Boolean(cs.sessions[sessionKey(cs)]);
     await ctx.reply(
-      `Выбран проект «${name}».\n` +
+      `Выбран проект «${entry.name}»${entry.localName ? "" : " (склонирован)"}.\n` +
         (hasSession ? "Продолжаем прошлый диалог этого проекта (сбросить: /new)." : "Диалог проекта пока пуст — пишите задачу.")
     );
     return;
@@ -434,16 +488,26 @@ bot.on("callback_query:data", async (ctx) => {
 
 async function handleProjectButton(ctx: Context, chatId: number): Promise<void> {
   const cs = getChatState(chatId);
-  const projects = listProjects();
-  lastProjectList.set(chatId, projects.map((p) => p.name));
+  let projects: ProjectEntry[];
+  try {
+    projects = await listProjects();
+  } catch (err) {
+    console.error("Ошибка получения списка репозиториев:", err);
+    await ctx.reply(
+      "Не удалось получить список репозиториев с GitHub: " +
+        (err instanceof Error ? err.message : String(err))
+    );
+    return;
+  }
+  lastProjectList.set(chatId, projects);
   const kb = new InlineKeyboard();
   projects.forEach((p, i) => {
-    kb.text(`${p.git ? "🟢" : "📂"} ${p.name}`, `proj:${i}`).row();
+    kb.text(`${p.localName ? "💻" : "☁️"} ${p.name}`, `proj:${i}`).row();
   });
   kb.text("➕ Новый проект", "projnew");
   await ctx.reply(
     `Сейчас выбран: ${modeLabel(cs)}\n` +
-      (projects.length > 0 ? "Выберите проект:" : "Проектов пока нет — создайте первый:"),
+      `Репозитории ${GITHUB_USER} (💻 — уже на диске, ☁️ — склонируется при выборе):`,
     { reply_markup: kb }
   );
 }
