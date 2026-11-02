@@ -974,6 +974,92 @@ bot.on("message:text", async (ctx) => {
   void runClaudeTurn(ctx, chatId, text);
 });
 
+// ---------- Приём файлов из Telegram ----------
+
+function sanitizeFileName(raw: string): string {
+  const name = path.basename(raw).replace(/[\\/:*?"<>|]/g, "_").trim();
+  return name || `file_${Date.now()}`;
+}
+
+// Скачивает файл Telegram в папку _incoming текущего проекта/чата
+async function saveTelegramFile(
+  ctx: Context,
+  fileId: string,
+  suggestedName: string,
+  cwd: string
+): Promise<string> {
+  const file = await ctx.api.getFile(fileId);
+  if (!file.file_path) throw new Error("Telegram не вернул путь файла");
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`Скачивание не удалось: ${res.status}`);
+  const dir = path.join(cwd, "_incoming");
+  fs.mkdirSync(dir, { recursive: true });
+  const dest = path.join(dir, sanitizeFileName(suggestedName || file.file_path));
+  fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  return dest;
+}
+
+async function handleIncomingFile(
+  ctx: Context,
+  fileId: string,
+  suggestedName: string,
+  fileSize: number | undefined,
+  caption: string | undefined
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (chatId === undefined) return;
+  if (running.has(chatId)) {
+    await ctx.reply("Я ещё выполняю предыдущую задачу — пришлите файл после её завершения или /stop.");
+    return;
+  }
+  // Ограничение Telegram Bot API на скачивание — 20 МБ
+  if (fileSize && fileSize > 20 * 1024 * 1024) {
+    await ctx.reply("Файл больше 20 МБ — Telegram не даёт ботам скачивать такие. Положите его в папку проекта вручную.");
+    return;
+  }
+  const cs = getChatState(chatId);
+  const cwd = cwdFor(cs);
+  fs.mkdirSync(cwd, { recursive: true });
+  try {
+    const dest = await saveTelegramFile(ctx, fileId, suggestedName, cwd);
+    await ctx.reply(`📎 Файл сохранён: ${dest}`);
+    const prompt =
+      `Я прислал файл, он сохранён по пути: ${dest}\n` +
+      (caption?.trim() ? caption.trim() : "Посмотри его.");
+    void runClaudeTurn(ctx, chatId, prompt);
+  } catch (err) {
+    console.error("Ошибка приёма файла:", err);
+    await ctx.reply(
+      "Не удалось скачать файл: " + (err instanceof Error ? err.message : String(err))
+    );
+  }
+}
+
+bot.on("message:document", async (ctx) => {
+  const doc = ctx.message.document;
+  await handleIncomingFile(
+    ctx,
+    doc.file_id,
+    doc.file_name ?? `document_${Date.now()}`,
+    doc.file_size,
+    ctx.message.caption
+  );
+});
+
+bot.on("message:photo", async (ctx) => {
+  // Берём самый большой размер фото
+  const sizes = ctx.message.photo;
+  const best = sizes[sizes.length - 1];
+  await handleIncomingFile(
+    ctx,
+    best.file_id,
+    `photo_${ctx.message.message_id}.jpg`,
+    best.file_size,
+    ctx.message.caption
+  );
+});
+
 // Запуск одного «хода» Клода: отправляет text в сессию текущего проекта/чата
 async function runClaudeTurn(ctx: Context, chatId: number, text: string): Promise<void> {
   const cs = getChatState(chatId);
