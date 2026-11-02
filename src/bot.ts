@@ -11,7 +11,14 @@ import * as path from "node:path";
 // ---------- Конфигурация ----------
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ALLOWED_USER_ID = Number(process.env.ALLOWED_USER_ID);
+// Список разрешённых Telegram ID через запятую (ALLOWED_USER_IDS=111,222).
+// Старое имя ALLOWED_USER_ID с одним ID тоже работает.
+const ALLOWED_USER_IDS = new Set(
+  (process.env.ALLOWED_USER_IDS || process.env.ALLOWED_USER_ID || "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0)
+);
 const WORKING_DIR =
   process.env.WORKING_DIR || path.join(process.cwd(), "workspace");
 
@@ -19,8 +26,8 @@ if (!BOT_TOKEN) {
   console.error("Ошибка: TELEGRAM_BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните.");
   process.exit(1);
 }
-if (!Number.isInteger(ALLOWED_USER_ID) || ALLOWED_USER_ID <= 0) {
-  console.error("Ошибка: ALLOWED_USER_ID не задан или некорректен (нужен числовой Telegram ID).");
+if (ALLOWED_USER_IDS.size === 0) {
+  console.error("Ошибка: ALLOWED_USER_IDS не задан или некорректен (числовые Telegram ID через запятую).");
   process.exit(1);
 }
 
@@ -109,7 +116,7 @@ const bot = new Bot(BOT_TOKEN);
 
 // Доступ только владельцу
 bot.use(async (ctx, next) => {
-  if (ctx.from?.id !== ALLOWED_USER_ID) {
+  if (!ctx.from || !ALLOWED_USER_IDS.has(ctx.from.id)) {
     console.warn(`Отклонён запрос от чужого пользователя: ${ctx.from?.id}`);
     return;
   }
