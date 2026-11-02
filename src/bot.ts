@@ -1060,6 +1060,55 @@ bot.on("message:photo", async (ctx) => {
   );
 });
 
+bot.on("message:video", async (ctx) => {
+  const v = ctx.message.video;
+  await handleIncomingFile(
+    ctx,
+    v.file_id,
+    v.file_name ?? `video_${ctx.message.message_id}.mp4`,
+    v.file_size,
+    ctx.message.caption
+  );
+});
+
+bot.on("message:animation", async (ctx) => {
+  const a = ctx.message.animation;
+  await handleIncomingFile(
+    ctx,
+    a.file_id,
+    a.file_name ?? `animation_${ctx.message.message_id}.mp4`,
+    a.file_size,
+    ctx.message.caption
+  );
+});
+
+bot.on("message:audio", async (ctx) => {
+  const a = ctx.message.audio;
+  await handleIncomingFile(
+    ctx,
+    a.file_id,
+    a.file_name ?? `audio_${ctx.message.message_id}.mp3`,
+    a.file_size,
+    ctx.message.caption
+  );
+});
+
+bot.on("message:voice", async (ctx) => {
+  const v = ctx.message.voice;
+  await handleIncomingFile(
+    ctx,
+    v.file_id,
+    `voice_${ctx.message.message_id}.ogg`,
+    v.file_size,
+    ctx.message.caption
+  );
+});
+
+bot.on("message:video_note", async (ctx) => {
+  const v = ctx.message.video_note;
+  await handleIncomingFile(ctx, v.file_id, `video_note_${ctx.message.message_id}.mp4`, v.file_size, undefined);
+});
+
 // Запуск одного «хода» Клода: отправляет text в сессию текущего проекта/чата
 async function runClaudeTurn(ctx: Context, chatId: number, text: string): Promise<void> {
   const cs = getChatState(chatId);
