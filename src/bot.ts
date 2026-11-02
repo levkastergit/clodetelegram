@@ -71,6 +71,10 @@ type ChatState = {
   // Абсолютный путь папки проекта; для старых записей отсутствует —
   // тогда берётся PROJECTS_DIR/<project>
   projectDir?: string;
+  // Авто-режим: все действия Клода одобряются без кнопок подтверждения
+  auto?: boolean;
+  // Модель: "opus" | "sonnet" | "haiku"; не задано — модель по умолчанию
+  model?: string;
   // ключ: "chat" или "project:<имя>" -> session_id Клода
   sessions: Record<string, string>;
 };
@@ -186,6 +190,25 @@ type PendingApproval = {
 const pendingApprovals = new Map<string, PendingApproval>();
 let approvalCounter = 0;
 
+// Вопросы Клода с вариантами ответа (инструмент AskUserQuestion)
+type AskQuestion = {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: { label: string; description?: string }[];
+};
+
+type PendingQuestion = {
+  resolve: (answer: string | null) => void;
+  options: string[];
+  selected: Set<number>;
+  multi: boolean;
+};
+const pendingQuestions = new Map<string, PendingQuestion>();
+let questionCounter = 0;
+// chatId -> id активного вопроса: позволяет ответить и обычным текстом
+const activeQuestionByChat = new Map<number, string>();
+
 // chatId -> список проектов, показанный последней инлайн-клавиатурой
 const lastProjectList = new Map<number, ProjectEntry[]>();
 // чаты, от которых ждём название нового проекта
@@ -226,18 +249,123 @@ function describeToolUse(name: string, input: Record<string, unknown>): string {
   return `${name}: ${brief.length > 200 ? brief.slice(0, 200) + "…" : brief}`;
 }
 
+// Показывает вопрос Клода кнопками в Telegram и ждёт выбор (или текст).
+async function askQuestionViaTelegram(
+  ctx: Context,
+  chatId: number,
+  q: AskQuestion,
+  signal: AbortSignal
+): Promise<string | null> {
+  const qid = String(++questionCounter);
+  const kb = new InlineKeyboard();
+  q.options.forEach((o, i) => {
+    kb.text(o.label.slice(0, 60), `qopt:${qid}:${i}`).row();
+  });
+  if (q.multiSelect) kb.text("✅ Готово", `qdone:${qid}`);
+
+  const lines = [`❓ ${q.question}`];
+  const described = q.options
+    .filter((o) => o.description)
+    .map((o) => `• ${o.label} — ${o.description}`);
+  if (described.length > 0) lines.push("", ...described);
+  lines.push(
+    "",
+    q.multiSelect
+      ? "Можно выбрать несколько и нажать «Готово», либо написать свой ответ текстом."
+      : "Нажмите кнопку либо напишите свой ответ текстом."
+  );
+  const msg = await ctx.reply(lines.join("\n"), { reply_markup: kb });
+
+  return await new Promise<string | null>((outerResolve) => {
+    let settled = false;
+    const finish = (answer: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      pendingQuestions.delete(qid);
+      if (activeQuestionByChat.get(chatId) === qid) activeQuestionByChat.delete(chatId);
+      // убираем кнопки у сообщения с вопросом
+      ctx.api.editMessageReplyMarkup(chatId, msg.message_id).catch(() => {});
+      outerResolve(answer);
+    };
+    const timer = setTimeout(() => finish(null), 10 * 60 * 1000);
+    signal.addEventListener("abort", () => finish(null));
+    pendingQuestions.set(qid, {
+      resolve: finish,
+      options: q.options.map((o) => o.label),
+      selected: new Set(),
+      multi: Boolean(q.multiSelect),
+    });
+    activeQuestionByChat.set(chatId, qid);
+  });
+}
+
+// Находит в финальном ответе нумерованный список «1. … 2. …» (2–10 пунктов)
+function detectNumberedOptions(text: string): number[] {
+  const nums: number[] = [];
+  for (const line of text.split("\n")) {
+    const m = /^\s*(\d{1,2})[.)]\s+/.exec(line);
+    if (m) nums.push(Number(m[1]));
+  }
+  const uniq = [...new Set(nums)];
+  if (
+    uniq.length >= 2 &&
+    uniq.length <= 10 &&
+    uniq[0] === 1 &&
+    uniq.every((n, i) => n === i + 1)
+  ) {
+    return uniq;
+  }
+  return [];
+}
+
 // ---------- Кнопки ----------
 
 const BTN_LIMITS = "📊 Лимиты";
 const BTN_PROJECT = "📁 Проект";
 const BTN_CHAT = "💬 Чат";
+const BTN_SETTINGS = "⚙️ Настройки";
+const MENU_BUTTONS = [BTN_LIMITS, BTN_PROJECT, BTN_CHAT, BTN_SETTINGS];
 
 const mainKeyboard = new Keyboard()
-  .text(BTN_LIMITS)
   .text(BTN_PROJECT)
   .text(BTN_CHAT)
+  .row()
+  .text(BTN_LIMITS)
+  .text(BTN_SETTINGS)
   .resized()
   .persistent();
+
+// ---------- Настройки (авто-режим и модель) ----------
+
+const MODEL_CHOICES: { label: string; value?: string }[] = [
+  { label: "По умолч." },
+  { label: "Opus", value: "opus" },
+  { label: "Sonnet", value: "sonnet" },
+  { label: "Haiku", value: "haiku" },
+];
+
+function settingsText(cs: ChatState): string {
+  const model =
+    MODEL_CHOICES.find((m) => m.value === cs.model)?.label ?? cs.model ?? "По умолч.";
+  return (
+    "⚙️ Настройки\n\n" +
+    `Авто-режим: ${cs.auto ? "ВКЛ 🟢" : "ВЫКЛ ⚪"}\n` +
+    "(в авто-режиме Клод выполняет команды без кнопок подтверждения; " +
+    "вопросы с вариантами всё равно приходят кнопками)\n\n" +
+    `Модель: ${model}`
+  );
+}
+
+function settingsKeyboard(cs: ChatState): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text(cs.auto ? "⏸ Выключить авто-режим" : "▶️ Включить авто-режим", "set:auto").row();
+  for (const m of MODEL_CHOICES) {
+    const current = (cs.model ?? undefined) === m.value;
+    kb.text(`${current ? "✓ " : ""}${m.label}`, `set:model:${m.value ?? "default"}`);
+  }
+  return kb;
+}
 
 // ---------- Лимиты подписки ----------
 // Используется экспериментальный метод SDK (shape может поменяться при обновлении
@@ -359,9 +487,11 @@ bot.command("start", async (ctx) => {
       `Сейчас выбран: ${modeLabel(cs)}\n` +
       `Папка проектов: ${PROJECTS_DIR}\n\n` +
       "Кнопки внизу:\n" +
-      `${BTN_LIMITS} — использование лимитов подписки\n` +
       `${BTN_PROJECT} — выбрать или создать проект (у каждого проекта свой диалог)\n` +
-      `${BTN_CHAT} — обычный чат без проекта\n\n` +
+      `${BTN_CHAT} — обычный чат без проекта\n` +
+      `${BTN_LIMITS} — использование лимитов подписки\n` +
+      `${BTN_SETTINGS} — авто-режим и выбор модели\n\n` +
+      "Когда Клод задаёт вопрос с вариантами — отвечайте кнопками под сообщением.\n\n" +
       "Команды:\n" +
       "/new — сбросить диалог текущего проекта/чата\n" +
       "/stop — прервать текущую задачу\n" +
@@ -427,6 +557,84 @@ bot.on("callback_query:data", async (ctx) => {
   const chatId = ctx.chatId;
   if (chatId === undefined) {
     await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // Ответ на вопрос Клода (один вариант)
+  const qopt = /^qopt:(\d+):(\d+)$/.exec(data);
+  if (qopt) {
+    const pq = pendingQuestions.get(qopt[1]);
+    if (!pq) {
+      await ctx.answerCallbackQuery({ text: "Этот вопрос уже неактуален." });
+      return;
+    }
+    const i = Number(qopt[2]);
+    if (pq.multi) {
+      if (pq.selected.has(i)) pq.selected.delete(i);
+      else pq.selected.add(i);
+      const chosen = [...pq.selected].map((x) => pq.options[x]).join(", ");
+      await ctx.answerCallbackQuery({ text: `Выбрано: ${chosen || "ничего"}` });
+    } else {
+      await ctx.answerCallbackQuery();
+      await ctx.reply(`➡️ ${pq.options[i]}`);
+      pq.resolve(pq.options[i]);
+    }
+    return;
+  }
+
+  // Ответ на вопрос Клода (мультивыбор, «Готово»)
+  const qdone = /^qdone:(\d+)$/.exec(data);
+  if (qdone) {
+    const pq = pendingQuestions.get(qdone[1]);
+    if (!pq) {
+      await ctx.answerCallbackQuery({ text: "Этот вопрос уже неактуален." });
+      return;
+    }
+    const labels = [...pq.selected].sort((a, b) => a - b).map((i) => pq.options[i]);
+    if (labels.length === 0) {
+      await ctx.answerCallbackQuery({ text: "Выберите хотя бы один вариант." });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await ctx.reply(`➡️ ${labels.join(", ")}`);
+    pq.resolve(labels.join(", "));
+    return;
+  }
+
+  // Ответ цифрой на нумерованный список в обычном ответе
+  const num = /^numreply:(\d+)$/.exec(data);
+  if (num) {
+    if (running.has(chatId)) {
+      await ctx.answerCallbackQuery({ text: "Дождитесь конца текущей задачи." });
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageReplyMarkup(undefined);
+    } catch {
+      // не критично
+    }
+    await ctx.reply(`➡️ ${num[1]}`);
+    await runClaudeTurn(ctx, chatId, num[1]);
+    return;
+  }
+
+  // Настройки: авто-режим и модель
+  if (data === "set:auto" || data.startsWith("set:model:")) {
+    const cs = getChatState(chatId);
+    if (data === "set:auto") {
+      cs.auto = !cs.auto;
+    } else {
+      const value = data.slice("set:model:".length);
+      cs.model = value === "default" ? undefined : value;
+    }
+    saveState();
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageText(settingsText(cs), { reply_markup: settingsKeyboard(cs) });
+    } catch {
+      // текст не изменился — не критично
+    }
     return;
   }
 
@@ -555,8 +763,18 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
 
+  // Если Клод ждёт ответа на вопрос — обычный текст считается ответом
+  const activeQid = activeQuestionByChat.get(chatId);
+  if (activeQid) {
+    const pq = pendingQuestions.get(activeQid);
+    if (pq) {
+      pq.resolve(text);
+      return;
+    }
+  }
+
   // Ожидаем название нового проекта
-  if (awaitingProjectName.has(chatId) && ![BTN_LIMITS, BTN_PROJECT, BTN_CHAT].includes(text)) {
+  if (awaitingProjectName.has(chatId) && !MENU_BUTTONS.includes(text)) {
     awaitingProjectName.delete(chatId);
     const name = sanitizeProjectName(text);
     if (!name) {
@@ -587,12 +805,22 @@ bot.on("message:text", async (ctx) => {
     await handleChatButton(ctx, chatId);
     return;
   }
+  if (text === BTN_SETTINGS) {
+    const cs = getChatState(chatId);
+    await ctx.reply(settingsText(cs), { reply_markup: settingsKeyboard(cs) });
+    return;
+  }
 
   if (running.has(chatId)) {
     await ctx.reply("Я ещё выполняю предыдущую задачу. Подождите или отправьте /stop.");
     return;
   }
 
+  await runClaudeTurn(ctx, chatId, text);
+});
+
+// Запуск одного «хода» Клода: отправляет text в сессию текущего проекта/чата
+async function runClaudeTurn(ctx: Context, chatId: number, text: string): Promise<void> {
   const cs = getChatState(chatId);
   const key = sessionKey(cs);
   const cwd = cwdFor(cs);
@@ -605,6 +833,27 @@ bot.on("message:text", async (ctx) => {
   // canUseTool вызывается для инструментов, не разрешённых автоматически
   // (прежде всего Bash) — спрашиваем подтверждение в Telegram.
   const canUseTool: CanUseTool = async (toolName, input, { signal }) => {
+    // Вопрос Клода с вариантами — показываем кнопки и возвращаем выбор
+    if (toolName === "AskUserQuestion") {
+      const questions = (input as { questions?: AskQuestion[] }).questions;
+      if (Array.isArray(questions) && questions.length > 0) {
+        const answers: Record<string, string> = {};
+        for (const qu of questions) {
+          const answer = await askQuestionViaTelegram(ctx, chatId, qu, signal);
+          if (answer === null) {
+            return { behavior: "deny", message: "Пользователь не ответил на вопрос" };
+          }
+          answers[qu.question] = answer;
+        }
+        return { behavior: "allow", updatedInput: { ...input, answers } };
+      }
+    }
+
+    // Авто-режим: всё остальное одобряется без подтверждений
+    if (cs.auto) {
+      return { behavior: "allow", updatedInput: input };
+    }
+
     const id = String(++approvalCounter);
     const keyboard = new InlineKeyboard()
       .text("✅ Разрешить", `appr:${id}:yes`)
@@ -658,11 +907,13 @@ bot.on("message:text", async (ctx) => {
       options: {
         cwd,
         resume: cs.sessions[key],
+        model: cs.model,
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
           append:
-            "Твой ответ будет показан в Telegram: пиши кратко, обычным текстом, без markdown-таблиц.",
+            "Твой ответ будет показан в Telegram: пиши кратко, обычным текстом, без markdown-таблиц. " +
+            "Если нужно спросить пользователя и предложить варианты ответа — вызывай инструмент AskUserQuestion.",
         },
         permissionMode: "acceptEdits",
         allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"],
@@ -701,6 +952,13 @@ bot.on("message:text", async (ctx) => {
 
     if (finalText) {
       await sendLong(ctx, finalText);
+      // Если в ответе нумерованный список — предлагаем ответить кнопкой
+      const numOptions = detectNumberedOptions(finalText);
+      if (numOptions.length > 0) {
+        const kb = new InlineKeyboard();
+        numOptions.forEach((n) => kb.text(String(n), `numreply:${n}`));
+        await ctx.reply("Можно ответить кнопкой:", { reply_markup: kb });
+      }
     } else if (resultError) {
       await ctx.reply(`Задача завершилась с ошибкой: ${resultError}`);
     } else if (abortController.signal.aborted) {
@@ -718,7 +976,7 @@ bot.on("message:text", async (ctx) => {
   } finally {
     running.delete(chatId);
   }
-});
+}
 
 bot.catch((err) => {
   console.error("Ошибка бота:", err.error);
