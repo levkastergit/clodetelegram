@@ -477,6 +477,11 @@ bot.use(async (ctx, next) => {
     console.warn(`Отклонён запрос от чужого пользователя: ${ctx.from?.id}`);
     return;
   }
+  if (ctx.message?.text) {
+    console.log(`[tg] ${ctx.from.id}: ${ctx.message.text.slice(0, 80)}`);
+  } else if (ctx.callbackQuery?.data) {
+    console.log(`[tg] ${ctx.from.id} кнопка: ${ctx.callbackQuery.data}`);
+  }
   await next();
 });
 
@@ -615,7 +620,7 @@ bot.on("callback_query:data", async (ctx) => {
       // не критично
     }
     await ctx.reply(`➡️ ${num[1]}`);
-    await runClaudeTurn(ctx, chatId, num[1]);
+    void runClaudeTurn(ctx, chatId, num[1]);
     return;
   }
 
@@ -794,7 +799,7 @@ bot.on("message:text", async (ctx) => {
 
   // Кнопки меню
   if (text === BTN_LIMITS) {
-    await handleLimits(ctx);
+    void handleLimits(ctx); // не блокируем приём следующих сообщений
     return;
   }
   if (text === BTN_PROJECT) {
@@ -816,7 +821,9 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  await runClaudeTurn(ctx, chatId, text);
+  // Не ждём завершения: иначе бот не сможет принимать новые сообщения
+  // (нажатия кнопок, /stop) пока идёт задача. Ошибки ловятся внутри.
+  void runClaudeTurn(ctx, chatId, text);
 });
 
 // Запуск одного «хода» Клода: отправляет text в сессию текущего проекта/чата
