@@ -195,6 +195,9 @@ function ioFor(userId: number, tabId: string): TurnIO {
   };
 }
 
+// Сообщения, отправленные пока в сессии шла задача, — уходят следующим ходом
+const queuedMessages = new Map<string, string[]>();
+
 function startTurn(userId: number, tab: ChatTab, text: string): void {
   const cs = getUserState(userId);
   // Название вкладки — первая реплика пользователя
@@ -206,6 +209,15 @@ function startTurn(userId: number, tab: ChatTab, text: string): void {
   pushEvent(userId, { type: "turn_started", tab: tab.id });
   void runTurn(userId, cs, tab, text, ioFor(userId, tab.id)).then((r) => {
     pushEvent(userId, { type: "done", tab: tab.id, ...r });
+    // Задача закончилась — если за это время накопились сообщения,
+    // отправляем их одним следующим ходом
+    const queued = queuedMessages.get(tab.id);
+    if (queued && queued.length > 0 && !r.aborted) {
+      queuedMessages.delete(tab.id);
+      startTurn(userId, tab, queued.join("\n\n"));
+    } else {
+      queuedMessages.delete(tab.id);
+    }
   });
 }
 
@@ -484,6 +496,7 @@ export function startWebApp(): void {
       res.status(404).json({ error: "Сессия не найдена." });
       return;
     }
+    queuedMessages.delete(tab.id);
     stopTab(tab.id);
     removeTab(cs, tab.id);
     res.json({ ok: true, activeTabId: cs.activeTabId ?? null });
@@ -525,7 +538,11 @@ export function startWebApp(): void {
       }
     }
     if (isTabRunning(tab.id)) {
-      res.status(409).json({ error: "В этой сессии задача ещё выполняется." });
+      // Задача ещё идёт — ставим сообщение в очередь, уйдёт следующим ходом
+      const q = queuedMessages.get(tab.id) ?? [];
+      q.push(text);
+      queuedMessages.set(tab.id, q);
+      res.json({ ok: true, queued: true });
       return;
     }
     startTurn(user.id, tab, text);
@@ -540,6 +557,7 @@ export function startWebApp(): void {
       res.status(404).json({ error: "Сессия не найдена." });
       return;
     }
+    queuedMessages.delete(tab.id); // «Стоп» отменяет и очередь
     res.json({ stopped: stopTab(tab.id) });
   });
 

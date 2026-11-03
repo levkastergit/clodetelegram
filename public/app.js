@@ -640,18 +640,10 @@
     }
     const text = inputEl.value.trim();
     if (!text && attachments.length === 0) return;
-    const t = findTab(activeTabId);
-    const c = tabCache(activeTabId);
     const parts = [];
     for (const a of attachments) parts.push(`Файл: ${a.path}`);
     if (text) parts.push(text);
     const full = parts.join("\n");
-    // Ответ на активный вопрос — просто текст, без вложений
-    const isAnswer = Boolean(c.question);
-    if (t.running && !isAnswer) {
-      toast("В этой сессии задача ещё выполняется.");
-      return;
-    }
     try {
       const r = await post("/api/message", { tab: activeTabId, text: full });
       inputEl.value = "";
@@ -660,6 +652,9 @@
       renderAttachments();
       if (!r.answeredQuestion) {
         addMsg(activeTabId, "user", full);
+      }
+      if (r.queued) {
+        toast("Сообщение уйдёт следующим ходом — Клод ещё работает.");
       }
     } catch (e) {
       toast(e.message);
