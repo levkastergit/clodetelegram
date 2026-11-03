@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Claude</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <button id="btnProject" class="chip">📁 …</button>
+      <div class="spacer"></div>
+      <button id="btnLimits" class="iconbtn" title="Лимиты">📊</button>
+      <button id="btnSettings" class="iconbtn" title="Настройки">⚙️</button>
+    </header>
+
+    <main id="messages"></main>
+
+    <div id="statusBar" hidden>
+      <span class="spinner"></span>
+      <span id="statusText">Думаю…</span>
+      <button id="btnStop">Стоп</button>
+    </div>
+
+    <div id="attachments"></div>
+
+    <footer>
+      <button id="btnAttach" class="iconbtn" title="Прикрепить файл">📎</button>
+      <input type="file" id="fileInput" hidden multiple>
+      <textarea id="input" rows="1" placeholder="Сообщение для Клода…"></textarea>
+      <button id="btnSend" class="iconbtn send" title="Отправить">➤</button>
+    </footer>
+
+    <div id="sheet" hidden>
+      <div id="sheetBackdrop"></div>
+      <div id="sheetBody"></div>
+    </div>
+
+    <div id="toast" hidden></div>
+    <div id="guard" hidden>
+      <p>Откройте это приложение из Telegram — кнопкой у бота.</p>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
