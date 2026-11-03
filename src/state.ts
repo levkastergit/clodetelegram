@@ -32,6 +32,8 @@ export type UserState = {
   auto?: boolean;
   // Модель: "opus" | "sonnet" | "haiku"; не задано — модель по умолчанию
   model?: string;
+  // Вовлечённость (reasoning effort): low|medium|high|xhigh|max; не задано — по умолчанию
+  effort?: string;
   // Гостевой пользователь: доступ ограничен одним проектом и своими диалогами
   guest?: boolean;
   // Сессии Claude, созданные этим пользователем, — гостю показываются только они

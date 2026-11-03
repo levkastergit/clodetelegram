@@ -515,6 +515,80 @@
     }
   }
 
+  // ---------- Модель, вовлечённость, авто-режим ----------
+
+  const MODELS = [
+    { v: null, label: "По умолчанию" },
+    { v: "opus", label: "Opus" },
+    { v: "sonnet", label: "Sonnet" },
+    { v: "haiku", label: "Haiku" },
+  ];
+  const EFFORTS = [
+    { v: null, label: "По умолчанию" },
+    { v: "low", label: "Низкая" },
+    { v: "medium", label: "Средняя" },
+    { v: "high", label: "Высокая" },
+    { v: "xhigh", label: "Очень высокая" },
+    { v: "max", label: "Максимум" },
+  ];
+
+  function labelOf(list, v) {
+    const found = list.find((x) => x.v === (v ?? null));
+    return found ? found.label : v;
+  }
+
+  function renderQuickbar() {
+    $("chipModel").textContent =
+      "🧠 " + labelOf(MODELS, me.settings.model);
+    $("chipEffort").textContent =
+      "⚡ " + labelOf(EFFORTS, me.settings.effort);
+    const auto = me.settings.auto;
+    const chipAuto = $("chipAuto");
+    chipAuto.textContent = auto ? "✓ Авто" : "Авто выкл";
+    chipAuto.classList.toggle("on", auto);
+  }
+
+  function choiceSheet(title, list, current, key) {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = title;
+    wrap.appendChild(h);
+    for (const item of list) {
+      const b = document.createElement("button");
+      b.className = "btn block";
+      if ((current ?? null) === item.v) b.classList.add("selected");
+      b.textContent = item.label;
+      b.onclick = async () => {
+        try {
+          const r = await post("/api/settings", { [key]: item.v });
+          me.settings.model = r.model;
+          me.settings.effort = r.effort;
+          me.settings.auto = r.auto;
+          renderQuickbar();
+          closeSheet();
+        } catch (e) {
+          toast(e.message);
+        }
+      };
+      wrap.appendChild(b);
+    }
+    openSheet(wrap);
+  }
+
+  $("chipModel").onclick = () =>
+    choiceSheet("Модель", MODELS, me.settings.model, "model");
+  $("chipEffort").onclick = () =>
+    choiceSheet("Вовлечённость", EFFORTS, me.settings.effort, "effort");
+  $("chipAuto").onclick = async () => {
+    try {
+      const r = await post("/api/settings", { auto: !me.settings.auto });
+      me.settings.auto = r.auto;
+      renderQuickbar();
+    } catch (e) {
+      toast(e.message);
+    }
+  };
+
   // ---------- Настройки ----------
 
   function settingsSheet() {
@@ -540,6 +614,7 @@
       try {
         const r = await post("/api/settings", { auto: cb.checked });
         me.settings.auto = r.auto;
+        renderQuickbar();
       } catch (e) {
         toast(e.message);
         cb.checked = me.settings.auto;
@@ -548,32 +623,11 @@
     autoRow.append(autoLbl, sw);
     wrap.appendChild(autoRow);
 
-    const models = [
-      { v: null, label: "По умолчанию" },
-      { v: "opus", label: "Opus" },
-      { v: "sonnet", label: "Sonnet" },
-      { v: "haiku", label: "Haiku" },
-    ];
-    const mLbl = document.createElement("div");
-    mLbl.className = "hint";
-    mLbl.textContent = "Модель:";
-    wrap.appendChild(mLbl);
-    for (const m of models) {
-      const b = document.createElement("button");
-      b.className = "btn block";
-      if ((me.settings.model ?? null) === m.v) b.classList.add("selected");
-      b.textContent = m.label;
-      b.onclick = async () => {
-        try {
-          const r = await post("/api/settings", { model: m.v });
-          me.settings.model = r.model;
-          settingsSheet(); // перерисовать
-        } catch (e) {
-          toast(e.message);
-        }
-      };
-      wrap.appendChild(b);
-    }
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent =
+      "Модель и вовлечённость переключаются чипсами под полем ввода.";
+    wrap.appendChild(hint);
     openSheet(wrap);
   }
 
@@ -780,6 +834,7 @@
       }
     }
     renderAccount();
+    renderQuickbar();
     renderSessions();
     connectEvents();
     loadLimits();

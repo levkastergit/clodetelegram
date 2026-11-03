@@ -1,6 +1,7 @@
 import {
   query,
   type CanUseTool,
+  type EffortLevel,
   type PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
@@ -37,18 +38,11 @@ export type TurnResult = {
 };
 
 // Одновременно может работать несколько вкладок (ходов) — каждая со своим
-// контроллером. Ограничиваем число параллельных задач на пользователя.
-const MAX_PARALLEL_PER_USER = 3;
+// контроллером.
 const running = new Map<string, { userId: number; ac: AbortController }>();
 
 export function isTabRunning(tabId: string): boolean {
   return running.has(tabId);
-}
-
-export function runningCountFor(userId: number): number {
-  let n = 0;
-  for (const r of running.values()) if (r.userId === userId) n++;
-  return n;
 }
 
 export function stopTab(tabId: string): boolean {
@@ -145,11 +139,6 @@ export async function runTurn(
   if (running.has(tab.id)) {
     return { error: "В этой сессии задача ещё выполняется." };
   }
-  if (runningCountFor(userId) >= MAX_PARALLEL_PER_USER) {
-    return {
-      error: `Слишком много параллельных задач (максимум ${MAX_PARALLEL_PER_USER}). Дождитесь завершения или остановите одну из них.`,
-    };
-  }
   const abortController = new AbortController();
   running.set(tab.id, { userId, ac: abortController });
 
@@ -206,6 +195,7 @@ export async function runTurn(
         cwd,
         resume: tab.claudeSessionId,
         model: cs.model,
+        effort: cs.effort as EffortLevel | undefined,
         systemPrompt: {
           type: "preset",
           preset: "claude_code",

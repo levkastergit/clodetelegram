@@ -299,7 +299,11 @@ export function startWebApp(): void {
     res.json({
       user: { id: user.id, name: user.firstName ?? user.username ?? String(user.id) },
       role,
-      settings: { auto: Boolean(cs.auto), model: cs.model ?? null },
+      settings: {
+        auto: Boolean(cs.auto),
+        model: cs.model ?? null,
+        effort: cs.effort ?? null,
+      },
       tabs: cs.tabs.map(tabSummary),
       activeTabId: cs.activeTabId ?? null,
     });
@@ -582,8 +586,20 @@ export function startWebApp(): void {
         cs.model = m;
       }
     }
+    if ("effort" in (req.body ?? {})) {
+      const e = req.body.effort;
+      if (e === null || e === "") {
+        cs.effort = undefined;
+      } else if (["low", "medium", "high", "xhigh", "max"].includes(e)) {
+        cs.effort = e;
+      }
+    }
     saveState();
-    res.json({ auto: Boolean(cs.auto), model: cs.model ?? null });
+    res.json({
+      auto: Boolean(cs.auto),
+      model: cs.model ?? null,
+      effort: cs.effort ?? null,
+    });
   });
 
   // Лимиты подписки — только владельцу (личные данные)
