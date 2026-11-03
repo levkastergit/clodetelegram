@@ -7,11 +7,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CHAT_DIR, GUEST_PROJECT } from "./config.js";
 import {
-  cwdFor,
-  getUserState,
+  cwdForTab,
   recordOwnedSession,
   saveState,
-  sessionKey,
+  touchTab,
+  type ChatTab,
+  type UserState,
 } from "./state.js";
 
 // ---------- Интерфейс «хода» Клода, не зависящий от Telegram/веба ----------
@@ -35,16 +36,25 @@ export type TurnResult = {
   aborted?: boolean;
 };
 
-const running = new Map<number, AbortController>(); // userId -> контроллер
+// Одновременно может работать несколько вкладок (ходов) — каждая со своим
+// контроллером. Ограничиваем число параллельных задач на пользователя.
+const MAX_PARALLEL_PER_USER = 3;
+const running = new Map<string, { userId: number; ac: AbortController }>();
 
-export function isRunning(userId: number): boolean {
-  return running.has(userId);
+export function isTabRunning(tabId: string): boolean {
+  return running.has(tabId);
 }
 
-export function stopTurn(userId: number): boolean {
-  const ac = running.get(userId);
-  if (!ac) return false;
-  ac.abort();
+export function runningCountFor(userId: number): number {
+  let n = 0;
+  for (const r of running.values()) if (r.userId === userId) n++;
+  return n;
+}
+
+export function stopTab(tabId: string): boolean {
+  const r = running.get(tabId);
+  if (!r) return false;
+  r.ac.abort();
   return true;
 }
 
@@ -64,7 +74,6 @@ export function describeToolUse(
 
 // ---------- Ограничения инструментов для гостя ----------
 
-// Инструменты, которые гостю одобряются автоматически (после проверки путей)
 const GUEST_AUTO_TOOLS = new Set([
   "Read",
   "Glob",
@@ -73,7 +82,6 @@ const GUEST_AUTO_TOOLS = new Set([
   "WebFetch",
   "TodoWrite",
 ]);
-// Инструменты с путями: разрешены только внутри папки гостевого проекта
 const GUEST_PATH_TOOLS = new Set([
   "Read",
   "Write",
@@ -85,7 +93,6 @@ const GUEST_PATH_TOOLS = new Set([
   "LS",
 ]);
 
-// Возвращает причину отказа или null, если инструмент гостю разрешён
 function guestToolDenial(
   toolName: string,
   input: Record<string, unknown>,
@@ -123,28 +130,30 @@ const GUEST_PROMPT_APPEND =
   "токены и ключи, список других проектов, историю других диалогов, данные подписки. " +
   "Если гость просит что-то из этого — вежливо откажись.";
 
-// ---------- Запуск одного «хода» Клода ----------
+// ---------- Запуск одного «хода» Клода во вкладке ----------
 
 export async function runTurn(
   userId: number,
+  cs: UserState,
+  tab: ChatTab,
   text: string,
   io: TurnIO
 ): Promise<TurnResult> {
-  const cs = getUserState(userId);
-  const key = sessionKey(cs);
-  const cwd = cwdFor(cs);
+  const cwd = cwdForTab(tab);
   fs.mkdirSync(cwd, { recursive: true });
 
-  if (running.has(userId)) {
-    return { error: "Предыдущая задача ещё выполняется." };
+  if (running.has(tab.id)) {
+    return { error: "В этой сессии задача ещё выполняется." };
+  }
+  if (runningCountFor(userId) >= MAX_PARALLEL_PER_USER) {
+    return {
+      error: `Слишком много параллельных задач (максимум ${MAX_PARALLEL_PER_USER}). Дождитесь завершения или остановите одну из них.`,
+    };
   }
   const abortController = new AbortController();
-  running.set(userId, abortController);
+  running.set(tab.id, { userId, ac: abortController });
 
-  // canUseTool вызывается для инструментов, не разрешённых автоматически —
-  // спрашиваем подтверждение через io (кнопки в мини-приложении).
   const canUseTool: CanUseTool = async (toolName, input, { signal }) => {
-    // Вопрос Клода с вариантами — показываем кнопки и возвращаем выбор
     if (toolName === "AskUserQuestion") {
       const questions = (input as { questions?: AskQuestion[] }).questions;
       if (Array.isArray(questions) && questions.length > 0) {
@@ -171,7 +180,6 @@ export async function runTurn(
       }
     }
 
-    // Авто-режим: всё остальное одобряется без подтверждений
     if (cs.auto) {
       return { behavior: "allow", updatedInput: input };
     }
@@ -196,7 +204,7 @@ export async function runTurn(
       prompt: text,
       options: {
         cwd,
-        resume: cs.sessions[key],
+        resume: tab.claudeSessionId,
         model: cs.model,
         systemPrompt: {
           type: "preset",
@@ -207,8 +215,6 @@ export async function runTurn(
             (cs.guest ? GUEST_PROMPT_APPEND : ""),
         },
         permissionMode: "acceptEdits",
-        // Гостю ничего не разрешаем заранее: каждый инструмент проходит
-        // проверку путей в canUseTool; Bash и субагенты запрещены совсем.
         allowedTools: cs.guest
           ? []
           : ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"],
@@ -218,8 +224,9 @@ export async function runTurn(
       },
     })) {
       if (message.type === "system" && message.subtype === "init") {
-        cs.sessions[key] = message.session_id;
+        tab.claudeSessionId = message.session_id;
         recordOwnedSession(cs, message.session_id);
+        touchTab(tab);
         saveState();
       } else if (message.type === "assistant") {
         for (const block of message.message.content) {
@@ -230,8 +237,9 @@ export async function runTurn(
           }
         }
       } else if (message.type === "result") {
-        cs.sessions[key] = message.session_id;
+        tab.claudeSessionId = message.session_id;
         recordOwnedSession(cs, message.session_id);
+        touchTab(tab);
         saveState();
         if (message.subtype === "success") {
           finalText = message.result;
@@ -252,7 +260,7 @@ export async function runTurn(
       error: `Произошла ошибка: ${err instanceof Error ? err.message : String(err)}`,
     };
   } finally {
-    running.delete(userId);
+    running.delete(tab.id);
   }
 }
 
@@ -260,35 +268,31 @@ export async function runTurn(
 // Используется экспериментальный метод SDK (shape может поменяться при обновлении
 // пакета) — он возвращает те же данные, что экран /usage в Claude Code.
 
-function progressBar(percent: number): string {
-  const filled = Math.round(Math.min(100, Math.max(0, percent)) / 10);
-  return "▰".repeat(filled) + "▱".repeat(10 - filled);
-}
+export type LimitWindow = {
+  label: string;
+  pct: number;
+  resetsAt: string | null;
+};
 
-function formatReset(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  return `, сброс ${d.toLocaleString("ru-RU", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  })}`;
-}
+export type LimitsInfo = {
+  subscription: string;
+  windows: LimitWindow[];
+  extra?: string;
+};
 
-function formatWindow(
+function windowOf(
   label: string,
   w: { utilization: number | null; resets_at: string | null } | null | undefined
-): string | null {
+): LimitWindow | null {
   if (!w || w.utilization === null || w.utilization === undefined) return null;
-  const pct = Math.round(w.utilization);
-  return `${progressBar(pct)} ${pct}% — ${label}${formatReset(w.resets_at)}`;
+  return {
+    label,
+    pct: Math.round(w.utilization),
+    resetsAt: w.resets_at,
+  };
 }
 
-export async function getLimitsLines(): Promise<string[]> {
-  // Метод живёт на объекте запроса, поэтому открываем минимальный query
-  // и закрываем его сразу после ответа (persistSession: false — без следов).
+export async function getLimits(): Promise<LimitsInfo> {
   const q = query({
     prompt: "ping",
     options: { cwd: CHAT_DIR, maxTurns: 1, persistSession: false },
@@ -299,34 +303,30 @@ export async function getLimitsLines(): Promise<string[]> {
     });
     const rl = usage.rate_limits;
     if (!usage.rate_limits_available || !rl) {
-      return [
-        "Данные о лимитах недоступны (для этого способа входа план-лимиты не применяются).",
-      ];
+      return { subscription: usage.subscription_type ?? "неизвестно", windows: [] };
     }
-    const lines: string[] = [`Подписка: ${usage.subscription_type ?? "неизвестно"}`, ""];
     const windows = [
-      formatWindow("сессия (5 ч)", rl.five_hour),
-      formatWindow("неделя, все модели", rl.seven_day),
-      formatWindow("неделя, Opus", rl.seven_day_opus),
-      formatWindow("неделя, Sonnet", rl.seven_day_sonnet),
+      windowOf("Сессия (5 ч)", rl.five_hour),
+      windowOf("Неделя (7 дн)", rl.seven_day),
+      windowOf("Неделя, Opus", rl.seven_day_opus),
+      windowOf("Неделя, Sonnet", rl.seven_day_sonnet),
       ...(rl.model_scoped ?? []).map((m) =>
-        formatWindow(`неделя, ${m.display_name}`, m)
+        windowOf(`Неделя, ${m.display_name}`, m)
       ),
-    ].filter((l): l is string => l !== null);
-    if (windows.length === 0) {
-      lines.push("Сервер не вернул ни одного окна лимитов.");
-    } else {
-      lines.push(...windows);
-    }
+    ].filter((w): w is LimitWindow => w !== null);
+    let extra: string | undefined;
     if (rl.extra_usage?.is_enabled && rl.extra_usage.utilization !== null) {
-      lines.push(
-        `Доп. кредиты: использовано ${Math.round(rl.extra_usage.utilization ?? 0)}%` +
-          (rl.extra_usage.used_credits !== null
-            ? ` (${rl.extra_usage.used_credits} ${rl.extra_usage.currency ?? ""})`
-            : "")
-      );
+      extra =
+        `Доп. кредиты: ${Math.round(rl.extra_usage.utilization ?? 0)}%` +
+        (rl.extra_usage.used_credits !== null
+          ? ` (${rl.extra_usage.used_credits} ${rl.extra_usage.currency ?? ""})`
+          : "");
     }
-    return lines;
+    return {
+      subscription: usage.subscription_type ?? "неизвестно",
+      windows,
+      extra,
+    };
   } finally {
     q.close();
   }

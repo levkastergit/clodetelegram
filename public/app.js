@@ -1,4 +1,4 @@
-/* Мини-приложение Telegram для общения с Claude */
+/* Мини-приложение Telegram для общения с Claude: сессии, лимиты, чат */
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp;
   const initData = tg ? tg.initData : "";
@@ -9,10 +9,15 @@
   const statusBar = $("statusBar");
   const statusText = $("statusText");
   const attachmentsEl = $("attachments");
+  const sessionListEl = $("sessionList");
+  const sidebarEl = $("sidebar");
 
   let me = null; // ответ /api/me
+  let tabs = []; // список сессий (tabSummary)
+  let activeTabId = null;
   let attachments = []; // [{path, name}]
-  let activeQuestion = null; // {id, multi, selected:Set, labels:[], cardEl}
+  // Кэш по вкладкам: сообщения, статус, ожидающие карточки
+  const cache = new Map(); // tabId -> {msgs:[], loaded, status, approval, question}
 
   if (!initData) {
     $("guard").hidden = false;
@@ -28,7 +33,7 @@
       ...opts,
       headers: {
         "X-Tg-Init-Data": initData,
-        ...(opts.body && !(opts.body instanceof Blob) && !(opts.body instanceof File)
+        ...(opts.body && typeof opts.body === "string"
           ? { "Content-Type": "application/json" }
           : {}),
         ...(opts.headers || {}),
@@ -40,9 +45,12 @@
   }
 
   const post = (path, body) =>
-    api(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
+    api(path, {
+      method: "POST",
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
 
-  // ---------- Утилиты интерфейса ----------
+  // ---------- Утилиты ----------
 
   let toastTimer;
   function toast(text) {
@@ -53,186 +61,598 @@
     toastTimer = setTimeout(() => (el.hidden = true), 3500);
   }
 
+  function tabCache(id) {
+    if (!cache.has(id)) {
+      cache.set(id, {
+        msgs: [],
+        loaded: false,
+        status: null,
+        approval: null,
+        question: null,
+      });
+    }
+    return cache.get(id);
+  }
+
+  function findTab(id) {
+    return tabs.find((t) => t.id === id);
+  }
+
+  function fmtReset(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return (
+      "сброс " +
+      d.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    );
+  }
+
   function scrollDown() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function addMsg(role, text) {
-    const div = document.createElement("div");
-    div.className = "msg " + role;
-    div.textContent = text;
-    messagesEl.appendChild(div);
-    scrollDown();
-    return div;
+  function autoGrow() {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
   }
 
-  function addCard() {
-    const div = document.createElement("div");
-    div.className = "msg card";
-    messagesEl.appendChild(div);
-    scrollDown();
-    return div;
+  // ---------- Сайдбар ----------
+
+  function renderAccount() {
+    $("accountName").textContent = me.user.name;
+    $("roleBadge").hidden = me.role !== "guest";
   }
 
-  function setStatus(text) {
-    statusBar.hidden = false;
-    statusText.textContent = text;
-  }
-
-  function clearStatus() {
-    statusBar.hidden = true;
-  }
-
-  function button(label, cls, onClick) {
-    const b = document.createElement("button");
-    b.className = "btn" + (cls ? " " + cls : "");
-    b.textContent = label;
-    b.addEventListener("click", onClick);
-    return b;
-  }
-
-  // Нумерованный список «1. … 2. …» в ответе — кнопки быстрого ответа
-  function detectNumberedOptions(text) {
-    const nums = [];
-    for (const line of text.split("\n")) {
-      const m = /^\s*(\d{1,2})[.)]\s+/.exec(line);
-      if (m) nums.push(Number(m[1]));
-    }
-    const uniq = [...new Set(nums)];
-    if (uniq.length >= 2 && uniq.length <= 10 && uniq[0] === 1 && uniq.every((n, i) => n === i + 1)) {
-      return uniq;
-    }
-    return [];
-  }
-
-  function offerNumberButtons(text) {
-    const nums = detectNumberedOptions(text);
-    if (nums.length === 0) return;
-    const card = addCard();
-    const row = document.createElement("div");
-    row.className = "btnrow";
-    for (const n of nums) {
-      row.appendChild(
-        button(String(n), "alt", () => {
-          card.remove();
-          sendMessage(String(n));
-        })
-      );
-    }
-    card.appendChild(row);
-    scrollDown();
-  }
-
-  // ---------- Подтверждения и вопросы ----------
-
-  const approvalCards = new Map(); // id -> card element
-
-  function showApproval(id, description) {
-    if (approvalCards.has(id)) return;
-    const card = addCard();
-    approvalCards.set(id, card);
-    const title = document.createElement("div");
-    title.className = "title";
-    title.textContent = "Клод хочет выполнить:";
-    const desc = document.createElement("div");
-    desc.className = "desc";
-    desc.textContent = description;
-    const row = document.createElement("div");
-    row.className = "btnrow";
-    const decide = (allowed) => {
-      post("/api/approve", { id, allowed }).catch((e) => toast(e.message));
-    };
-    row.appendChild(button("✅ Разрешить", "", () => decide(true)));
-    row.appendChild(button("❌ Отклонить", "alt", () => decide(false)));
-    card.append(title, desc, row);
-    scrollDown();
-    if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("warning");
-  }
-
-  function closeApproval(id, allowed) {
-    const card = approvalCards.get(id);
-    if (!card) return;
-    approvalCards.delete(id);
-    card.innerHTML = "";
-    const note = document.createElement("div");
-    note.className = "hint";
-    note.textContent = allowed ? "✅ Разрешено" : "❌ Отклонено";
-    card.appendChild(note);
-  }
-
-  function showQuestion(q) {
-    if (activeQuestion && activeQuestion.id === q.id) return;
-    const card = addCard();
-    const state = {
-      id: q.id,
-      multi: Boolean(q.multi),
-      selected: new Set(),
-      labels: q.options.map((o) => o.label),
-      cardEl: card,
-    };
-    activeQuestion = state;
-
-    const title = document.createElement("div");
-    title.className = "title";
-    title.textContent = "❓ " + q.question;
-    card.appendChild(title);
-
-    const answer = (text) => {
-      post("/api/answer", { id: q.id, answer: text }).catch((e) => toast(e.message));
-    };
-
-    q.options.forEach((o, i) => {
-      const b = button(o.label + (o.description ? "\n" + o.description : ""), "option", () => {
-        if (state.multi) {
-          if (state.selected.has(i)) {
-            state.selected.delete(i);
-            b.classList.remove("selected");
-          } else {
-            state.selected.add(i);
-            b.classList.add("selected");
-          }
-        } else {
-          answer(state.labels[i]);
+  async function loadLimits() {
+    if (me.role !== "owner") return;
+    try {
+      const data = await api("/api/limits");
+      const list = $("usageList");
+      list.innerHTML = "";
+      for (const w of data.windows) {
+        const item = document.createElement("div");
+        item.className = "usage-item";
+        const top = document.createElement("div");
+        top.className = "u-top";
+        const lbl = document.createElement("span");
+        lbl.textContent = w.label;
+        const pct = document.createElement("span");
+        pct.className = "u-pct";
+        pct.textContent = w.pct + "%";
+        top.append(lbl, pct);
+        const bar = document.createElement("div");
+        bar.className = "u-bar";
+        const fill = document.createElement("div");
+        fill.className = "u-fill";
+        fill.style.width = Math.min(100, Math.max(0, w.pct)) + "%";
+        if (w.pct >= 90) fill.style.background = "var(--danger)";
+        bar.appendChild(fill);
+        item.append(top, bar);
+        const reset = fmtReset(w.resetsAt);
+        if (reset) {
+          const r = document.createElement("div");
+          r.className = "u-reset";
+          r.textContent = reset;
+          item.appendChild(r);
         }
-      });
-      card.appendChild(b);
-    });
-
-    if (state.multi) {
-      card.appendChild(
-        button("✅ Готово", "", () => {
-          const chosen = [...state.selected].sort((a, b2) => a - b2).map((i) => state.labels[i]);
-          if (chosen.length === 0) {
-            toast("Выберите хотя бы один вариант.");
-            return;
-          }
-          answer(chosen.join(", "));
-        })
-      );
+        list.appendChild(item);
+      }
+      if (data.extra) {
+        const e = document.createElement("div");
+        e.className = "usage-extra";
+        e.textContent = data.extra;
+        list.appendChild(e);
+      }
+      $("usageSection").hidden = data.windows.length === 0 && !data.extra;
+    } catch {
+      // лимиты не критичны — просто не показываем
     }
+  }
 
+  let limitsTimer;
+  function scheduleLimitsRefresh() {
+    clearTimeout(limitsTimer);
+    limitsTimer = setTimeout(loadLimits, 4000);
+  }
+
+  function renderSessions() {
+    sessionListEl.innerHTML = "";
+    if (tabs.length === 0) {
+      const hint = document.createElement("div");
+      hint.className = "empty-hint";
+      hint.textContent = "Сессий пока нет — создайте первую.";
+      sessionListEl.appendChild(hint);
+      return;
+    }
+    for (const t of tabs) {
+      const c = cache.get(t.id);
+      const item = document.createElement("div");
+      item.className = "session-item";
+      if (t.id === activeTabId) item.classList.add("active");
+      if (t.running) item.classList.add("running");
+      if (c && (c.approval || c.question) && t.id !== activeTabId) {
+        item.classList.add("attention");
+      }
+      const dot = document.createElement("span");
+      dot.className = "s-dot";
+      const body = document.createElement("div");
+      body.className = "s-body";
+      const title = document.createElement("div");
+      title.className = "s-title";
+      title.textContent = t.title;
+      body.appendChild(title);
+      const proj = document.createElement("div");
+      proj.className = "s-proj";
+      proj.textContent = t.project ? "📁 " + t.project : "💬 без проекта";
+      body.appendChild(proj);
+      const close = document.createElement("button");
+      close.className = "s-close";
+      close.textContent = "✕";
+      close.title = "Закрыть сессию";
+      close.onclick = (e) => {
+        e.stopPropagation();
+        closeTab(t.id);
+      };
+      item.append(dot, body, close);
+      item.onclick = () => selectTab(t.id);
+      sessionListEl.appendChild(item);
+    }
+  }
+
+  function toggleSidebar(open) {
+    const want = open ?? !sidebarEl.classList.contains("open");
+    sidebarEl.classList.toggle("open", want);
+    $("sidebarBackdrop").hidden = !want;
+  }
+
+  // ---------- Чат ----------
+
+  function addMsg(tabId, role, text) {
+    tabCache(tabId).msgs.push({ role, text });
+    if (tabId === activeTabId) renderChat();
+  }
+
+  function renderStatus() {
+    const c = activeTabId ? tabCache(activeTabId) : null;
+    const t = activeTabId ? findTab(activeTabId) : null;
+    const show = Boolean(c && c.status && t && t.running);
+    statusBar.hidden = !show;
+    if (show) statusText.textContent = c.status;
+    $("btnStop").hidden = !(t && t.running);
+  }
+
+  function renderTopbar() {
+    const t = activeTabId ? findTab(activeTabId) : null;
+    $("tabTitle").textContent = t ? t.title : "Claude";
+    $("tabProject").textContent = t
+      ? t.project
+        ? "📁 " + t.project
+        : "💬 без проекта"
+      : "";
+  }
+
+  function renderChat() {
+    messagesEl.innerHTML = "";
+    if (!activeTabId) {
+      const n = document.createElement("div");
+      n.className = "msg notice";
+      n.textContent = "Создайте сессию, чтобы начать диалог с Клодом.";
+      messagesEl.appendChild(n);
+      renderTopbar();
+      renderStatus();
+      return;
+    }
+    const c = tabCache(activeTabId);
+    for (const m of c.msgs) {
+      const el = document.createElement("div");
+      el.className = "msg " + m.role;
+      el.textContent = m.text;
+      messagesEl.appendChild(el);
+    }
+    if (c.approval) messagesEl.appendChild(approvalCard(c.approval));
+    if (c.question) messagesEl.appendChild(questionCard(c.question));
+    renderTopbar();
+    renderStatus();
+    scrollDown();
+  }
+
+  // Карточка подтверждения действия
+  function approvalCard(ap) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const title = document.createElement("div");
+    title.className = "c-title";
+    title.textContent = "Разрешить действие?";
+    const desc = document.createElement("div");
+    desc.className = "c-desc";
+    desc.textContent = ap.description;
+    const actions = document.createElement("div");
+    actions.className = "c-actions";
+    const yes = document.createElement("button");
+    yes.className = "btn primary";
+    yes.textContent = "✅ Разрешить";
+    yes.onclick = () => post("/api/approve", { id: ap.id, allowed: true }).catch((e) => toast(e.message));
+    const no = document.createElement("button");
+    no.className = "btn danger";
+    no.textContent = "❌ Отклонить";
+    no.onclick = () => post("/api/approve", { id: ap.id, allowed: false }).catch((e) => toast(e.message));
+    actions.append(yes, no);
+    card.append(title, desc, actions);
+    return card;
+  }
+
+  // Карточка вопроса с вариантами
+  function questionCard(q) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const title = document.createElement("div");
+    title.className = "c-title";
+    title.textContent = q.header ? `${q.header}: ${q.question}` : q.question;
+    card.appendChild(title);
+    if (!q.selected) q.selected = new Set();
+    for (let i = 0; i < q.options.length; i++) {
+      const o = q.options[i];
+      const b = document.createElement("button");
+      b.className = "btn block";
+      if (q.selected.has(i)) b.classList.add("selected");
+      b.textContent = (q.multi && q.selected.has(i) ? "☑ " : "") + o.label;
+      if (o.description) {
+        const d = document.createElement("span");
+        d.className = "b-desc";
+        d.textContent = o.description;
+        b.appendChild(d);
+      }
+      b.onclick = () => {
+        if (q.multi) {
+          if (q.selected.has(i)) q.selected.delete(i);
+          else q.selected.add(i);
+          renderChat();
+        } else {
+          post("/api/answer", { id: q.id, answer: o.label }).catch((e) =>
+            toast(e.message)
+          );
+        }
+      };
+      card.appendChild(b);
+    }
+    if (q.multi) {
+      const done = document.createElement("button");
+      done.className = "btn primary block";
+      done.textContent = "✅ Готово";
+      done.onclick = () => {
+        const labels = [...q.selected].sort().map((i) => q.options[i].label);
+        if (labels.length === 0) {
+          toast("Выберите хотя бы один вариант");
+          return;
+        }
+        post("/api/answer", { id: q.id, answer: labels.join(", ") }).catch((e) =>
+          toast(e.message)
+        );
+      };
+      card.appendChild(done);
+    }
     const hint = document.createElement("div");
     hint.className = "hint";
-    hint.textContent = state.multi
-      ? "Можно выбрать несколько и нажать «Готово», либо написать свой ответ."
-      : "Нажмите кнопку либо напишите свой ответ.";
+    hint.textContent = "Можно ответить и текстом в поле ввода.";
     card.appendChild(hint);
-    scrollDown();
-    if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("warning");
+    return card;
   }
 
-  function closeQuestion(id, answer) {
-    if (!activeQuestion || activeQuestion.id !== id) return;
-    const card = activeQuestion.cardEl;
-    activeQuestion = null;
-    card.innerHTML = "";
-    const note = document.createElement("div");
-    note.className = "hint";
-    note.textContent = answer ? "➡️ " + answer : "Вопрос отменён";
-    card.appendChild(note);
+  // ---------- Переключение и загрузка сессий ----------
+
+  async function selectTab(id) {
+    activeTabId = id;
+    toggleSidebar(false);
+    renderSessions();
+    renderChat();
+    post("/api/activate", { id }).catch(() => {});
+    const c = tabCache(id);
+    if (!c.loaded) {
+      c.loaded = true;
+      try {
+        const data = await api("/api/history?tab=" + encodeURIComponent(id));
+        if (data.messages.length > 0) {
+          c.msgs = data.messages.concat(c.msgs);
+          if (activeTabId === id) renderChat();
+        }
+      } catch {
+        c.loaded = false;
+      }
+    }
   }
 
-  // ---------- Поток событий ----------
+  async function closeTab(id) {
+    const t = findTab(id);
+    if (t && t.running && !confirm("Задача ещё выполняется. Закрыть сессию?")) {
+      return;
+    }
+    try {
+      const r = await api("/api/tab/" + encodeURIComponent(id), {
+        method: "DELETE",
+      });
+      tabs = tabs.filter((x) => x.id !== id);
+      cache.delete(id);
+      if (activeTabId === id) {
+        activeTabId = r.activeTabId;
+        if (activeTabId) selectTab(activeTabId);
+      }
+      renderSessions();
+      renderChat();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  // ---------- Новая сессия ----------
+
+  function openSheet(html) {
+    $("sheetBody").innerHTML = "";
+    if (html) $("sheetBody").appendChild(html);
+    $("sheet").hidden = false;
+  }
+  function closeSheet() {
+    $("sheet").hidden = true;
+  }
+  $("sheetBackdrop").onclick = closeSheet;
+
+  async function newSessionFlow() {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = "Новая сессия";
+    wrap.appendChild(h);
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "Загружаю список проектов…";
+    wrap.appendChild(hint);
+    openSheet(wrap);
+
+    let projects;
+    try {
+      projects = (await api("/api/projects")).projects;
+    } catch (e) {
+      hint.textContent = e.message;
+      return;
+    }
+    hint.remove();
+
+    if (me.role === "owner") {
+      const chat = document.createElement("button");
+      chat.className = "btn block";
+      chat.textContent = "💬 Чат без проекта";
+      chat.onclick = () => createTab({ project: null });
+      wrap.appendChild(chat);
+
+      const np = document.createElement("button");
+      np.className = "btn block";
+      np.textContent = "🆕 Новый проект (папка)";
+      np.onclick = () => {
+        const name = prompt("Название нового проекта:");
+        if (name && name.trim()) createTab({ newProject: name.trim() });
+      };
+      wrap.appendChild(np);
+
+      const lbl = document.createElement("div");
+      lbl.className = "hint";
+      lbl.textContent = "Или выберите проект:";
+      wrap.appendChild(lbl);
+    }
+
+    for (const p of projects) {
+      const b = document.createElement("button");
+      b.className = "btn block";
+      b.textContent = "📁 " + p.name + (p.local ? "" : "  ⤓");
+      if (!p.local) b.title = "Будет склонирован с GitHub";
+      b.onclick = () => pickProjectSession(p);
+      wrap.appendChild(b);
+    }
+  }
+
+  // Шаг 2: новый диалог или продолжение прошлого
+  async function pickProjectSession(p) {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = "📁 " + p.name;
+    wrap.appendChild(h);
+    const fresh = document.createElement("button");
+    fresh.className = "btn primary block";
+    fresh.textContent = "🆕 Новый диалог";
+    fresh.onclick = () => createTab({ project: p.name });
+    wrap.appendChild(fresh);
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = "Ищу прошлые диалоги…";
+    wrap.appendChild(hint);
+    openSheet(wrap);
+
+    try {
+      const data = await api(
+        "/api/project-sessions?name=" + encodeURIComponent(p.name)
+      );
+      hint.remove();
+      if (data.sessions.length > 0) {
+        const lbl = document.createElement("div");
+        lbl.className = "hint";
+        lbl.textContent = "Продолжить прошлый диалог:";
+        wrap.appendChild(lbl);
+        for (const s of data.sessions) {
+          const b = document.createElement("button");
+          b.className = "btn block";
+          const when = new Date(s.mtime).toLocaleString("ru-RU", {
+            day: "2-digit",
+            month: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          b.textContent = s.title;
+          const d = document.createElement("span");
+          d.className = "b-desc";
+          d.textContent = when;
+          b.appendChild(d);
+          b.onclick = () => createTab({ project: p.name, resume: s.id });
+          wrap.appendChild(b);
+        }
+      }
+    } catch {
+      hint.textContent = "Прошлые диалоги не загрузились.";
+    }
+  }
+
+  async function createTab(body) {
+    closeSheet();
+    try {
+      const r = await post("/api/tab", body);
+      tabs.push(r.tab);
+      renderSessions();
+      await selectTab(r.tab.id);
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  // ---------- Настройки ----------
+
+  function settingsSheet() {
+    const wrap = document.createElement("div");
+    const h = document.createElement("h3");
+    h.textContent = "Настройки";
+    wrap.appendChild(h);
+
+    const autoRow = document.createElement("div");
+    autoRow.className = "setting-row";
+    const autoLbl = document.createElement("div");
+    autoLbl.innerHTML =
+      "Авто-режим<br><small style='color:var(--hint)'>Действия без подтверждений</small>";
+    const sw = document.createElement("label");
+    sw.className = "switch";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = me.settings.auto;
+    const track = document.createElement("span");
+    track.className = "track";
+    sw.append(cb, track);
+    cb.onchange = async () => {
+      try {
+        const r = await post("/api/settings", { auto: cb.checked });
+        me.settings.auto = r.auto;
+      } catch (e) {
+        toast(e.message);
+        cb.checked = me.settings.auto;
+      }
+    };
+    autoRow.append(autoLbl, sw);
+    wrap.appendChild(autoRow);
+
+    const models = [
+      { v: null, label: "По умолчанию" },
+      { v: "opus", label: "Opus" },
+      { v: "sonnet", label: "Sonnet" },
+      { v: "haiku", label: "Haiku" },
+    ];
+    const mLbl = document.createElement("div");
+    mLbl.className = "hint";
+    mLbl.textContent = "Модель:";
+    wrap.appendChild(mLbl);
+    for (const m of models) {
+      const b = document.createElement("button");
+      b.className = "btn block";
+      if ((me.settings.model ?? null) === m.v) b.classList.add("selected");
+      b.textContent = m.label;
+      b.onclick = async () => {
+        try {
+          const r = await post("/api/settings", { model: m.v });
+          me.settings.model = r.model;
+          settingsSheet(); // перерисовать
+        } catch (e) {
+          toast(e.message);
+        }
+      };
+      wrap.appendChild(b);
+    }
+    openSheet(wrap);
+  }
+
+  // ---------- Отправка ----------
+
+  async function send() {
+    if (!activeTabId) {
+      newSessionFlow();
+      return;
+    }
+    const text = inputEl.value.trim();
+    if (!text && attachments.length === 0) return;
+    const t = findTab(activeTabId);
+    const c = tabCache(activeTabId);
+    const parts = [];
+    for (const a of attachments) parts.push(`Файл: ${a.path}`);
+    if (text) parts.push(text);
+    const full = parts.join("\n");
+    // Ответ на активный вопрос — просто текст, без вложений
+    const isAnswer = Boolean(c.question);
+    if (t.running && !isAnswer) {
+      toast("В этой сессии задача ещё выполняется.");
+      return;
+    }
+    try {
+      const r = await post("/api/message", { tab: activeTabId, text: full });
+      inputEl.value = "";
+      autoGrow();
+      attachments = [];
+      renderAttachments();
+      if (!r.answeredQuestion) {
+        addMsg(activeTabId, "user", full);
+      }
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  function renderAttachments() {
+    attachmentsEl.innerHTML = "";
+    for (let i = 0; i < attachments.length; i++) {
+      const a = attachments[i];
+      const chip = document.createElement("span");
+      chip.className = "attach-chip";
+      chip.textContent = "📎 " + a.name + " ";
+      const del = document.createElement("button");
+      del.textContent = "✕";
+      del.onclick = () => {
+        attachments.splice(i, 1);
+        renderAttachments();
+      };
+      chip.appendChild(del);
+      attachmentsEl.appendChild(chip);
+    }
+  }
+
+  async function uploadFiles(files) {
+    if (!activeTabId) {
+      toast("Сначала создайте сессию.");
+      return;
+    }
+    for (const f of files) {
+      try {
+        const r = await api(
+          "/api/upload?tab=" +
+            encodeURIComponent(activeTabId) +
+            "&name=" +
+            encodeURIComponent(f.name),
+          { method: "POST", body: f }
+        );
+        attachments.push(r);
+      } catch (e) {
+        toast(`${f.name}: ${e.message}`);
+      }
+    }
+    renderAttachments();
+  }
+
+  // ---------- SSE ----------
 
   function connectEvents() {
     const es = new EventSource("/api/events?auth=" + encodeURIComponent(initData));
@@ -243,385 +663,132 @@
       } catch {
         return;
       }
-      if (e.type === "status") {
-        setStatus(e.text);
-      } else if (e.type === "approval") {
-        showApproval(e.id, e.description);
-      } else if (e.type === "approval_done") {
-        closeApproval(e.id, e.allowed);
-      } else if (e.type === "question") {
-        showQuestion(e);
-      } else if (e.type === "question_done") {
-        closeQuestion(e.id, e.answer);
-      } else if (e.type === "done") {
-        clearStatus();
-        if (e.text) {
-          addMsg("bot", e.text);
-          offerNumberButtons(e.text);
-        } else if (e.aborted) {
-          addMsg("note", "Задача остановлена.");
-        } else if (e.error) {
-          addMsg("note", e.error);
-        }
-        if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+      const t = e.tab ? findTab(e.tab) : null;
+      const c = e.tab ? tabCache(e.tab) : null;
+      switch (e.type) {
+        case "turn_started":
+          if (t) t.running = true;
+          if (c) c.status = "⏳ Думаю…";
+          renderSessions();
+          renderStatus();
+          break;
+        case "status":
+          if (c) c.status = e.text;
+          if (e.tab === activeTabId) renderStatus();
+          break;
+        case "tab_title":
+          if (t) t.title = e.title;
+          renderSessions();
+          renderTopbar();
+          break;
+        case "approval":
+          if (c) c.approval = { id: e.id, description: e.description };
+          if (e.tab === activeTabId) renderChat();
+          else renderSessions();
+          break;
+        case "approval_done":
+          if (c) c.approval = null;
+          if (e.tab === activeTabId) renderChat();
+          else renderSessions();
+          break;
+        case "question":
+          if (c)
+            c.question = {
+              id: e.id,
+              question: e.question,
+              header: e.header,
+              multi: e.multi,
+              options: e.options,
+              selected: new Set(),
+            };
+          if (e.tab === activeTabId) renderChat();
+          else renderSessions();
+          break;
+        case "question_done":
+          if (c) {
+            c.question = null;
+            if (e.answer) c.msgs.push({ role: "user", text: e.answer });
+          }
+          if (e.tab === activeTabId) renderChat();
+          else renderSessions();
+          break;
+        case "done":
+          if (t) t.running = false;
+          if (c) {
+            c.status = null;
+            c.approval = null;
+            c.question = null;
+            if (e.text) c.msgs.push({ role: "assistant", text: e.text });
+            else if (e.error) c.msgs.push({ role: "error", text: e.error });
+            else if (e.aborted)
+              c.msgs.push({ role: "notice", text: "⏹ Остановлено." });
+          }
+          renderSessions();
+          if (e.tab === activeTabId) renderChat();
+          scheduleLimitsRefresh();
+          break;
       }
     };
     es.onerror = () => {
-      // браузер переподключится сам; при протухшем initData страницу надо переоткрыть
+      // браузер переподключится сам
     };
   }
 
-  // ---------- Отправка сообщений ----------
+  // ---------- Обработчики ----------
 
-  function composeText(raw) {
-    const lines = attachments.map((a) => "Я прислал файл, он сохранён по пути: " + a.path);
-    if (raw) lines.push(raw);
-    return lines.join("\n");
-  }
-
-  async function sendMessage(raw) {
-    const text = composeText(raw.trim());
-    if (!text) return;
-    try {
-      const r = await post("/api/message", { text });
-      addMsg("user", raw.trim() || text);
-      if (!r.answeredQuestion) setStatus("⏳ Думаю…");
-      attachments = [];
-      renderAttachments();
-      inputEl.value = "";
-      autosize();
-    } catch (e) {
-      toast(e.message);
-    }
-  }
-
-  $("btnSend").addEventListener("click", () => sendMessage(inputEl.value));
-  inputEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !tg.platform.match(/android|ios/)) {
-      e.preventDefault();
-      sendMessage(inputEl.value);
-    }
-  });
-
-  function autosize() {
-    inputEl.style.height = "auto";
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
-  }
-  inputEl.addEventListener("input", autosize);
-
-  $("btnStop").addEventListener("click", () => {
-    post("/api/stop").catch((e) => toast(e.message));
-  });
-
-  // ---------- Файлы ----------
-
-  $("btnAttach").addEventListener("click", () => $("fileInput").click());
-
-  $("fileInput").addEventListener("change", async (e) => {
-    for (const file of e.target.files) {
-      if (file.size > 50 * 1024 * 1024) {
-        toast(`«${file.name}» больше 50 МБ — не загружаю.`);
-        continue;
-      }
-      try {
-        setStatus("📤 Загружаю " + file.name + "…");
-        const r = await api("/api/upload?name=" + encodeURIComponent(file.name), {
-          method: "POST",
-          body: file,
-          headers: { "Content-Type": "application/octet-stream" },
-        });
-        attachments.push(r);
-        renderAttachments();
-      } catch (err) {
-        toast("Не удалось загрузить " + file.name + ": " + err.message);
-      } finally {
-        clearStatus();
-      }
-    }
+  $("btnNewSession").onclick = newSessionFlow;
+  $("btnSettings").onclick = settingsSheet;
+  $("btnMenu").onclick = () => toggleSidebar();
+  $("sidebarBackdrop").onclick = () => toggleSidebar(false);
+  $("btnSend").onclick = send;
+  $("btnStop").onclick = () => {
+    if (activeTabId) post("/api/stop", { tab: activeTabId }).catch((e) => toast(e.message));
+  };
+  $("btnAttach").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = (e) => {
+    uploadFiles([...e.target.files]);
     e.target.value = "";
-  });
-
-  function renderAttachments() {
-    attachmentsEl.innerHTML = "";
-    attachments.forEach((a, i) => {
-      const chip = document.createElement("span");
-      chip.className = "attach-chip";
-      chip.textContent = "📎 " + a.name + " ";
-      const x = document.createElement("button");
-      x.textContent = "✕";
-      x.addEventListener("click", () => {
-        attachments.splice(i, 1);
-        renderAttachments();
-      });
-      chip.appendChild(x);
-      attachmentsEl.appendChild(chip);
-    });
-  }
-
-  // ---------- Шторка (проекты, сессии, настройки, лимиты) ----------
-
-  const sheet = $("sheet");
-  const sheetBody = $("sheetBody");
-  $("sheetBackdrop").addEventListener("click", closeSheet);
-
-  function openSheet() {
-    sheet.hidden = false;
-  }
-  function closeSheet() {
-    sheet.hidden = true;
-    sheetBody.innerHTML = "";
-  }
-
-  function sheetTitle(text) {
-    const h = document.createElement("h3");
-    h.textContent = text;
-    sheetBody.appendChild(h);
-  }
-
-  function listItem(label, sub, onClick) {
-    const b = document.createElement("button");
-    b.className = "list-item";
-    b.textContent = label;
-    if (sub) {
-      const s = document.createElement("span");
-      s.className = "sub";
-      s.textContent = sub;
-      b.appendChild(s);
-    }
-    b.addEventListener("click", onClick);
-    sheetBody.appendChild(b);
-    return b;
-  }
-
-  // Проекты
-  $("btnProject").addEventListener("click", async () => {
-    sheetBody.innerHTML = "";
-    sheetTitle("Проекты");
-    openSheet();
-    try {
-      const r = await api("/api/projects");
-      if (me.role === "owner") {
-        listItem("💬 Чат без проекта", null, async () => {
-          try {
-            await post("/api/chat");
-            closeSheet();
-            await loadMe();
-            await loadHistory();
-          } catch (e) {
-            toast(e.message);
-          }
-        });
-        listItem("➕ Новый проект", null, async () => {
-          const name = prompt("Название нового проекта (имя папки):");
-          if (!name) return;
-          try {
-            await post("/api/project/new", { name });
-            closeSheet();
-            await loadMe();
-            messagesEl.innerHTML = "";
-            addMsg("note", "Проект создан. Пишите задачу.");
-          } catch (e) {
-            toast(e.message);
-          }
-        });
-      }
-      for (const p of r.projects) {
-        listItem(
-          (p.local ? "💻 " : "☁️ ") + p.name,
-          p.name === r.current ? "текущий" : p.local ? null : "склонируется при выборе",
-          () => selectProject(p.name, !p.local)
-        );
-      }
-    } catch (e) {
-      toast(e.message);
-      closeSheet();
+  };
+  inputEl.addEventListener("input", autoGrow);
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !tg.platform?.match(/android|ios/)) {
+      e.preventDefault();
+      send();
     }
   });
-
-  async function selectProject(name, needsClone) {
-    sheetBody.innerHTML = "";
-    sheetTitle(needsClone ? "Клонирую «" + name + "»…" : "Открываю «" + name + "»…");
-    try {
-      const r = await post("/api/project", { name });
-      showSessions(name, r.sessions);
-    } catch (e) {
-      toast(e.message);
-      closeSheet();
-    }
-  }
-
-  function showSessions(project, sessions) {
-    sheetBody.innerHTML = "";
-    sheetTitle("«" + project + "»: диалог");
-    listItem("🆕 Новый диалог", null, async () => {
-      try {
-        await post("/api/session", { id: null });
-        closeSheet();
-        await loadMe();
-        messagesEl.innerHTML = "";
-        addMsg("note", "Новый диалог — пишите задачу.");
-      } catch (e) {
-        toast(e.message);
-      }
-    });
-    for (const s of sessions) {
-      const d = new Date(s.mtime);
-      const when = d.toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-      listItem(s.title.slice(0, 60) || "(без названия)", when, async () => {
-        try {
-          await post("/api/session", { id: s.id });
-          closeSheet();
-          await loadMe();
-          await loadHistory();
-        } catch (e) {
-          toast(e.message);
-        }
-      });
-    }
-    if (sessions.length === 0) {
-      const p = document.createElement("p");
-      p.className = "hint";
-      p.textContent = "Прошлых диалогов нет.";
-      sheetBody.appendChild(p);
-    }
-  }
-
-  // Настройки
-  $("btnSettings").addEventListener("click", () => {
-    sheetBody.innerHTML = "";
-    sheetTitle("Настройки");
-    openSheet();
-
-    const autoRow = document.createElement("div");
-    autoRow.className = "setting-row";
-    const autoLabel = document.createElement("div");
-    autoLabel.innerHTML =
-      "Авто-режим<br><small style='color:var(--hint)'>выполнять действия без подтверждений</small>";
-    const sw = document.createElement("label");
-    sw.className = "switch";
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = me.state.auto;
-    const track = document.createElement("span");
-    track.className = "track";
-    sw.append(cb, track);
-    cb.addEventListener("change", async () => {
-      try {
-        const r = await post("/api/settings", { auto: cb.checked });
-        me.state.auto = r.auto;
-      } catch (e) {
-        toast(e.message);
-        cb.checked = me.state.auto;
-      }
-    });
-    autoRow.append(autoLabel, sw);
-    sheetBody.appendChild(autoRow);
-
-    const modelRow = document.createElement("div");
-    modelRow.className = "setting-row";
-    const ml = document.createElement("div");
-    ml.textContent = "Модель";
-    const seg = document.createElement("div");
-    seg.className = "seg";
-    const models = [
-      { label: "По умолч.", value: null },
-      { label: "Opus", value: "opus" },
-      { label: "Sonnet", value: "sonnet" },
-      { label: "Haiku", value: "haiku" },
-    ];
-    const rerender = () => {
-      seg.innerHTML = "";
-      for (const m of models) {
-        const b = button(m.label, me.state.model === m.value ? "" : "alt", async () => {
-          try {
-            const r = await post("/api/settings", { model: m.value });
-            me.state.model = r.model;
-            rerender();
-          } catch (e) {
-            toast(e.message);
-          }
-        });
-        seg.appendChild(b);
-      }
-    };
-    rerender();
-    modelRow.append(ml, seg);
-    sheetBody.appendChild(modelRow);
-  });
-
-  // Лимиты
-  $("btnLimits").addEventListener("click", async () => {
-    sheetBody.innerHTML = "";
-    sheetTitle("Лимиты подписки");
-    openSheet();
-    const pre = document.createElement("pre");
-    pre.className = "limits";
-    pre.textContent = "⏳ Запрашиваю…";
-    sheetBody.appendChild(pre);
-    try {
-      const r = await api("/api/limits");
-      pre.textContent = r.lines.join("\n");
-    } catch (e) {
-      pre.textContent = e.message;
-    }
-  });
-
-  // ---------- Загрузка состояния ----------
-
-  function headerLabel() {
-    const s = me.state;
-    return s.mode === "project" && s.project ? "📁 " + s.project : "💬 Чат";
-  }
-
-  async function loadMe() {
-    me = await api("/api/me");
-    $("btnProject").textContent = headerLabel();
-    $("btnLimits").hidden = me.role !== "owner";
-    if (me.running) setStatus("⏳ Выполняется задача…");
-    else clearStatus();
-    if (me.pending.approval) showApproval(me.pending.approval.id, me.pending.approval.description);
-    if (me.pending.question) {
-      showQuestion({
-        id: me.pending.question.id,
-        question: me.pending.question.question,
-        multi: me.pending.question.multi,
-        options: me.pending.question.options,
-      });
-    }
-  }
-
-  async function loadHistory() {
-    messagesEl.innerHTML = "";
-    try {
-      const r = await api("/api/history");
-      for (const m of r.messages) addMsg(m.role === "user" ? "user" : "bot", m.text);
-      if (r.messages.length === 0) {
-        addMsg("note", me.role === "guest"
-          ? "Доступен проект «" + (me.state.project || "") + "». Пишите задачу."
-          : "Пишите задачу — или выберите проект сверху.");
-      }
-      scrollDown();
-    } catch (e) {
-      toast(e.message);
-    }
-  }
 
   // ---------- Старт ----------
 
   (async () => {
     try {
-      await loadMe();
+      me = await api("/api/me");
     } catch (e) {
       $("guard").hidden = false;
       $("guard").querySelector("p").textContent = e.message;
       return;
     }
+    tabs = me.tabs;
+    activeTabId = me.activeTabId;
+    // Ожидающие карточки с сервера (если приложение переоткрыли)
+    for (const t of tabs) {
+      const c = tabCache(t.id);
+      if (t.pending) {
+        if (t.pending.approval) c.approval = t.pending.approval;
+        if (t.pending.question) {
+          c.question = { ...t.pending.question, selected: new Set() };
+        }
+      }
+    }
+    renderAccount();
+    renderSessions();
     connectEvents();
-    await loadHistory();
+    loadLimits();
+    if (activeTabId && findTab(activeTabId)) {
+      selectTab(activeTabId);
+    } else if (tabs.length > 0) {
+      selectTab(tabs[tabs.length - 1].id);
+    } else {
+      renderChat();
+    }
   })();
 })();

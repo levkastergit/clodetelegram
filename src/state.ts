@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,26 +11,37 @@ import {
   PROJECTS_DIR,
 } from "./config.js";
 
-// ---------- Состояние пользователей (режим, проект, сессии) ----------
-// Ключ — Telegram user id (для личных чатов совпадает со старым chat id,
-// поэтому state.json от бота продолжает работать).
+// ---------- Состояние пользователей ----------
+// Ключ — Telegram user id. У пользователя несколько вкладок-сессий (tabs),
+// каждая привязана к проекту (или обычному чату) и сессии Claude.
+
+export type ChatTab = {
+  id: string; // внутренний id вкладки
+  title: string;
+  project?: string; // имя проекта; нет — обычный чат
+  projectDir?: string; // абсолютный путь папки проекта
+  claudeSessionId?: string; // id сессии Claude (для resume)
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type UserState = {
-  mode: "chat" | "project";
-  project?: string;
-  // Абсолютный путь папки проекта; для старых записей отсутствует —
-  // тогда берётся PROJECTS_DIR/<project>
-  projectDir?: string;
+  tabs: ChatTab[];
+  activeTabId?: string;
   // Авто-режим: все действия Клода одобряются без подтверждений
   auto?: boolean;
   // Модель: "opus" | "sonnet" | "haiku"; не задано — модель по умолчанию
   model?: string;
   // Гостевой пользователь: доступ ограничен одним проектом и своими диалогами
   guest?: boolean;
-  // Сессии, созданные этим пользователем, — гостю показываются только они
+  // Сессии Claude, созданные этим пользователем, — гостю показываются только они
   ownedSessions?: string[];
-  // ключ: "chat" или "project:<имя>" -> session_id Клода
-  sessions: Record<string, string>;
+
+  // Старый формат (до вкладок) — поля нужны только для миграции
+  mode?: "chat" | "project";
+  project?: string;
+  projectDir?: string;
+  sessions?: Record<string, string>;
 };
 
 const STATE_FILE = path.join(process.cwd(), "state.json");
@@ -48,55 +60,109 @@ export function saveState(): void {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
+function newTab(partial: Partial<ChatTab>): ChatTab {
+  const now = new Date().toISOString();
+  return {
+    id: crypto.randomUUID(),
+    title: partial.title || "Новый диалог",
+    project: partial.project,
+    projectDir: partial.projectDir,
+    claudeSessionId: partial.claudeSessionId,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// Перевод старого формата (mode/project/sessions) во вкладки
+function migrate(cs: UserState): void {
+  if (cs.tabs) return;
+  cs.tabs = [];
+  const old = cs.sessions ?? {};
+  for (const [key, claudeId] of Object.entries(old)) {
+    if (key === "chat") {
+      cs.tabs.push(
+        newTab({ title: "Чат без проекта", claudeSessionId: claudeId })
+      );
+    } else if (key.startsWith("project:")) {
+      const name = key.slice("project:".length);
+      cs.tabs.push(
+        newTab({
+          title: name,
+          project: name,
+          projectDir:
+            cs.project === name && cs.projectDir
+              ? cs.projectDir
+              : path.join(PROJECTS_DIR, name),
+          claudeSessionId: claudeId,
+        })
+      );
+    }
+  }
+  cs.activeTabId = cs.tabs[cs.tabs.length - 1]?.id;
+  delete cs.mode;
+  delete cs.project;
+  delete cs.projectDir;
+  delete cs.sessions;
+}
+
 export function getUserState(userId: number): UserState {
   const key = String(userId);
   if (!state[key]) {
-    state[key] = { mode: "chat", sessions: {} };
+    state[key] = { tabs: [] };
   }
+  migrate(state[key]);
   return state[key];
 }
 
-// Гость всегда закреплён за одним проектом — чат и другие проекты недоступны
+export function createTab(
+  cs: UserState,
+  partial: Partial<ChatTab>
+): ChatTab {
+  const tab = newTab(partial);
+  cs.tabs.push(tab);
+  cs.activeTabId = tab.id;
+  saveState();
+  return tab;
+}
+
+export function getTab(cs: UserState, tabId: string): ChatTab | undefined {
+  return cs.tabs.find((t) => t.id === tabId);
+}
+
+export function removeTab(cs: UserState, tabId: string): void {
+  cs.tabs = cs.tabs.filter((t) => t.id !== tabId);
+  if (cs.activeTabId === tabId) {
+    cs.activeTabId = cs.tabs[cs.tabs.length - 1]?.id;
+  }
+  saveState();
+}
+
+export function touchTab(tab: ChatTab): void {
+  tab.updatedAt = new Date().toISOString();
+}
+
+// Гость всегда закреплён за одним проектом
 export function ensureGuestState(userId: number): UserState {
   const cs = getUserState(userId);
-  if (
-    !cs.guest ||
-    cs.mode !== "project" ||
-    cs.project !== GUEST_PROJECT ||
-    cs.projectDir !== GUEST_PROJECT_DIR
-  ) {
+  if (!cs.guest) {
     cs.guest = true;
-    cs.mode = "project";
-    cs.project = GUEST_PROJECT;
-    cs.projectDir = GUEST_PROJECT_DIR;
     saveState();
   }
   return cs;
 }
 
-export function sessionKey(cs: UserState): string {
-  return cs.mode === "project" && cs.project ? `project:${cs.project}` : "chat";
-}
-
-export function cwdFor(cs: UserState): string {
-  if (cs.mode === "project" && cs.project) {
-    return cs.projectDir || path.join(PROJECTS_DIR, cs.project);
+export function cwdForTab(tab: ChatTab): string {
+  if (tab.project) {
+    return tab.projectDir || path.join(PROJECTS_DIR, tab.project);
   }
   return CHAT_DIR;
 }
 
-export function modeLabel(cs: UserState): string {
-  return cs.mode === "project" && cs.project
-    ? `проект «${cs.project}»`
-    : "обычный чат (без проекта)";
-}
-
-// Запоминает, что сессия создана этим пользователем (для фильтра диалогов гостя)
+// Запоминает, что сессия Claude создана этим пользователем (фильтр для гостя)
 export function recordOwnedSession(cs: UserState, sessionId: string): void {
   if (!cs.ownedSessions) cs.ownedSessions = [];
   if (!cs.ownedSessions.includes(sessionId)) {
     cs.ownedSessions.push(sessionId);
-    // не даём списку расти бесконечно
     if (cs.ownedSessions.length > 500) {
       cs.ownedSessions.splice(0, cs.ownedSessions.length - 500);
     }
@@ -105,8 +171,6 @@ export function recordOwnedSession(cs: UserState, sessionId: string): void {
 
 // ---------- Проекты ----------
 
-// Проект = репозиторий аккаунта GitHub или дополнительный локальный путь.
-// dir — абсолютный путь папки на диске, если она уже есть.
 export type ProjectEntry = { name: string; dir?: string };
 
 function localDirs(): Map<string, string> {
@@ -143,11 +207,14 @@ export async function listProjects(): Promise<ProjectEntry[]> {
       dir: localName ? path.join(PROJECTS_DIR, localName) : undefined,
     };
   });
-  // Дополнительные проекты по абсолютным путям (вне GitHub)
   for (const p of EXTRA_PROJECTS) {
     entries.push({ name: path.basename(p), dir: p });
   }
   return entries;
+}
+
+export function guestProjectEntry(): ProjectEntry {
+  return { name: GUEST_PROJECT, dir: GUEST_PROJECT_DIR };
 }
 
 export function sanitizeProjectName(raw: string): string {
@@ -163,8 +230,6 @@ export function sanitizeFileName(raw: string): string {
 }
 
 // ---------- Прошлые сессии Claude Code по папке проекта ----------
-// Claude Code (и SDK, и Cursor) хранит диалоги в ~/.claude/projects/<папка>,
-// где имя папки — путь проекта с заменой всех спецсимволов на дефисы.
 
 export type SessionInfo = { id: string; mtime: Date; title: string };
 
@@ -172,7 +237,6 @@ function encodeProjectDir(dir: string): string {
   return dir.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
-// Папка ~/.claude/projects/<встреченное-имя> для данной папки проекта
 function claudeProjectFolder(projectDir: string): string | undefined {
   const projectsRoot = path.join(os.homedir(), ".claude", "projects");
   const encoded = encodeProjectDir(projectDir).toLowerCase();
@@ -186,7 +250,6 @@ function claudeProjectFolder(projectDir: string): string | undefined {
   }
 }
 
-// Читает начало файла сессии и достаёт первую реплику пользователя
 function readSessionTitle(file: string): string {
   try {
     const fd = fs.openSync(file, "r");
@@ -219,7 +282,7 @@ function readSessionTitle(file: string): string {
 
 export function listPastSessions(
   projectDir: string,
-  limit = 5,
+  limit = 10,
   onlyIds?: Set<string>
 ): SessionInfo[] {
   const full = claudeProjectFolder(projectDir);
@@ -264,6 +327,10 @@ function extractText(content: unknown): string {
 }
 
 const SESSION_ID_RE = /^[\w.-]+$/;
+
+export function isValidSessionId(id: string): boolean {
+  return SESSION_ID_RE.test(id);
+}
 
 export function readSessionHistory(
   projectDir: string,

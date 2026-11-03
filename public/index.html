@@ -9,29 +9,58 @@
 </head>
 <body>
   <div id="app">
-    <header>
-      <button id="btnProject" class="chip">📁 …</button>
-      <div class="spacer"></div>
-      <button id="btnLimits" class="iconbtn" title="Лимиты">📊</button>
-      <button id="btnSettings" class="iconbtn" title="Настройки">⚙️</button>
-    </header>
+    <aside id="sidebar">
+      <div class="side-section">
+        <div class="side-label">Аккаунт</div>
+        <div class="side-row" id="accountRow">
+          <span id="accountName">…</span>
+          <span class="badge" id="roleBadge" hidden>гость</span>
+        </div>
+      </div>
 
-    <main id="messages"></main>
+      <div class="side-section" id="usageSection" hidden>
+        <div class="side-label">Лимиты</div>
+        <div id="usageList" class="usage-list"></div>
+      </div>
 
-    <div id="statusBar" hidden>
-      <span class="spinner"></span>
-      <span id="statusText">Думаю…</span>
-      <button id="btnStop">Стоп</button>
-    </div>
+      <div class="side-section grow">
+        <div class="side-label-row">
+          <div class="side-label">Менеджер сессий</div>
+          <button id="btnSettings" class="iconbtn" title="Настройки">⚙</button>
+        </div>
+        <button id="btnNewSession" class="new-session">+ Новая сессия</button>
+        <div id="sessionList" class="session-list"></div>
+      </div>
+    </aside>
 
-    <div id="attachments"></div>
+    <div id="sidebarBackdrop" hidden></div>
 
-    <footer>
-      <button id="btnAttach" class="iconbtn" title="Прикрепить файл">📎</button>
-      <input type="file" id="fileInput" hidden multiple>
-      <textarea id="input" rows="1" placeholder="Сообщение для Клода…"></textarea>
-      <button id="btnSend" class="iconbtn send" title="Отправить">➤</button>
-    </footer>
+    <section id="main">
+      <header id="topbar">
+        <button id="btnMenu" class="iconbtn menu" title="Сессии">☰</button>
+        <div class="title-wrap">
+          <div id="tabTitle">Claude</div>
+          <div id="tabProject" class="subtitle"></div>
+        </div>
+        <button id="btnStop" class="stopbtn" hidden>Стоп</button>
+      </header>
+
+      <main id="messages"></main>
+
+      <div id="statusBar" hidden>
+        <span class="spinner"></span>
+        <span id="statusText">Думаю…</span>
+      </div>
+
+      <div id="attachments"></div>
+
+      <footer>
+        <button id="btnAttach" class="iconbtn" title="Прикрепить файл">+</button>
+        <input type="file" id="fileInput" hidden multiple>
+        <textarea id="input" rows="1" placeholder="Сообщение для Клода…"></textarea>
+        <button id="btnSend" class="iconbtn send" title="Отправить">➤</button>
+      </footer>
+    </section>
 
     <div id="sheet" hidden>
       <div id="sheetBackdrop"></div>
